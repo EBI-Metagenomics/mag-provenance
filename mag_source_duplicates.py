@@ -3,8 +3,8 @@
 Find MAGs in ENA that are the same organism, built from the same source sample, and
 deposited more than once.
 
-Public reads are often assembled and binned again in a new study, and the resulting
-genomes deposited under that study. Two genomes are duplicates when all three of these
+Public reads can be assembled and binned again by another study, and the genomes
+deposited under that study. Two genomes are duplicates when all three of these
 hold:
 
     1. they trace back to the same source sample(s)   (ENA metadata)
@@ -22,7 +22,8 @@ giving both options:
     Phase 1 (--accessions) checks 1 and 2. It looks each genome up in ENA, follows its
     sample's `derived_from` links back to the source sample, then asks ENA which other
     genomes came from that sample (the reverse lookup). Genomes with exactly the same
-    source samples form a "source group". Writes mags.tsv.
+    source samples form a "source group". Writes mags.tsv. With --fasta-dir, input MAGs
+    with the same sequence are compared only once (see identical_sequences.tsv).
 
     Phase 2 (--gemsparcl-clusters) checks 3. Within each source group, genomes that
     gemsparcl put in the same cluster become a duplicate group. Writes duplicates.tsv
@@ -33,6 +34,7 @@ giving both options:
 
 import argparse
 import csv
+import gzip
 import hashlib
 import http.client
 import json
@@ -129,7 +131,7 @@ def classify_accession(raw):
 
 
 # ---------------------------------------------------------------------------
-# Finding the samples a MAG was made from, in its sample's `derived_from` field (phase 1)
+# Reading derived_from values (phase 1)
 # ---------------------------------------------------------------------------
 #
 # Each MAG has its own sample record in ENA. Its `related_sample_accession` field lists
@@ -212,10 +214,8 @@ def parse_related_field(value):
     Entries with any other relation are skipped. Values keep the order they were written
     in (fingerprint() sorts them later).
 
-    A value that matches no known shape is kept as PARENT_UNPARSABLE, not dropped. If the
-    MAG's other values lead to source samples, it is marked partly_traced, because
-    its set of source samples is incomplete. If they don't, _Trace.finish() sets the
-    status that says why.
+    A value of no known shape is kept as PARENT_UNPARSABLE, so the MAG can't look fully
+    traced: it becomes partly_traced, or gets a status that says why.
     """
     if not value:
         return []
@@ -465,9 +465,8 @@ STATUS_ACCESSION_NOT_FOUND = "accession_not_found"
 STATUS_INVALID = "invalid_accession"
 
 # ENA assembly_type values that are not MAGs. These genomes get not_a_mag and are not
-# traced. Any other value counts as a MAG, and so does an empty one (e.g. old assemblies,
-# or ERZ analyses that are not assemblies), so a genome is left out only when ENA says
-# it is not a MAG.
+# traced. Any other value, or none, counts as a MAG: a genome is left out only when ENA
+# says it isn't one.
 NON_MAG_ASSEMBLY_TYPES = frozenset({
     "clone or isolate",                                  # grown in culture
     "environmental single-cell amplified genome (sag)",  # from a single cell
@@ -507,8 +506,9 @@ class GenomeRecord:
     """One genome, as one row of mags.tsv. The field names are the column names.
 
     Read from ENA: the study, center, software, quality scores, taxonomy and fasta_ftp.
-    Worked out by this script: source_sample_status, source_samples, source_group_id,
-    duplicate_status and gemsparcl_cluster (set in phase 2).
+    Worked out by this script: sequence_check, sequence_md5, source_sample_status,
+    source_samples, source_group_id, duplicate_status and gemsparcl_cluster (set in
+    phase 2).
 
     version and assembly_accession are not written to mags.tsv: the version is added to
     genome_accession (GCA_937896655.1), and assembly_accession (the GCA of a WGS set,
@@ -537,6 +537,8 @@ class GenomeRecord:
     source_group_id: str = ""
     duplicate_status: str = ""
     gemsparcl_cluster: str = ""
+    sequence_check: str = ""
+    sequence_md5: str = ""
 
 
 # Where to look up each kind of input accession: (ENA endpoint, fields to request, column
@@ -680,6 +682,162 @@ def _mark_non_mags(records):
 
 
 # ---------------------------------------------------------------------------
+# Identical sequences (phase 1, step 1, with --fasta-dir)
+# ---------------------------------------------------------------------------
+#
+# Genomes with the same sequence are compared only once: one copy is kept for the source
+# groups and gemsparcl, and the others get duplicate_status duplicate_sequence. Every
+# copy is still traced, so its provenance is recorded.
+#
+# A genome's checksum is the MD5 of the sorted MD5s of its sequences (uppercased, without
+# whitespace), so headers, contig order, line length and case don't change it.
+
+# Values of the sequence_check column (empty if not checked: no --fasta-dir, an
+# invalid, not found, not_a_mag or repeated input, or a genome found by reverse lookup):
+#   unique          no other checked genome has the same sequence
+#   duplicate_kept  the copy kept for the comparisons (see identical_sequences.tsv)
+#   duplicate       another copy; not compared again
+#   no_fasta_file   no usable FASTA file: missing, another version, empty or unreadable
+# The sequence_md5 column holds each checked genome's checksum, for matching in later
+# runs.
+SEQ_UNIQUE = "unique"
+SEQ_DUPLICATE_KEPT = "duplicate_kept"
+SEQ_DUPLICATE = "duplicate"
+SEQ_NO_FASTA_FILE = "no_fasta_file"
+
+FASTA_EXTENSIONS = (".fa", ".fasta", ".fna", ".fsa")
+IDENTICAL_FILE = "identical_sequences.tsv"
+IDENTICAL_COLUMNS = ["sequence_md5", "kept_genome", "n_genomes", "genomes", "studies"]
+
+# A copy from EMG is preferred as the kept one.
+EBI_CENTER_NAME = "EMG"
+
+
+def _accession_of_file(name):
+    """Read the accession from a FASTA file name:
+
+        GCA_937896655.1.fna.gz  -> ("GCA_937896655", "1")
+        ERZ21930252.fa          -> ("ERZ21930252", "")
+        notes.txt               -> None
+    """
+    if name.endswith(".gz"):
+        name = name[:-3]
+    for extension in FASTA_EXTENSIONS:
+        if name.endswith(extension):
+            return split_version(name[:-len(extension)])
+    return None
+
+
+def find_fasta_files(fasta_dir, records):
+    """Find each record's FASTA file in fasta_dir by its name: GCA_937896655.1.fna.gz or
+    GCA_937896655.fna.gz for GCA_937896655 at version 1. A file named with another
+    version, such as GCA_937896655.2.fna.gz, is not used. Returns [(record, path)] and
+    the names of the files not used."""
+    files_by_accession = {}  # {accession: [(version, file name)]}
+    for name in sorted(os.listdir(fasta_dir)):
+        parsed = _accession_of_file(name)
+        if parsed:
+            files_by_accession.setdefault(parsed[0], []).append((parsed[1], name))
+    found, other_version = [], []
+    for record in records:
+        files = files_by_accession.get(record.genome_accession, [])
+        usable = [name for version, name in files
+                  if not version or not record.version or version == record.version]
+        if usable:
+            found.append((record, os.path.join(fasta_dir, usable[0])))
+        else:
+            other_version.extend(name for _, name in files)
+    return found, other_version
+
+
+def _read_fasta_sequences(path):
+    """Read the sequences of a FASTA file (plain or gzipped) one at a time, uppercased
+    and without whitespace."""
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8", errors="replace") as handle:
+        parts = None
+        for line in handle:
+            if line.startswith(">"):
+                if parts is not None:
+                    yield "".join(parts).upper()
+                parts = []
+            elif parts is not None:
+                parts.append("".join(line.split()))
+        if parts is not None:
+            yield "".join(parts).upper()
+
+
+def sequence_checksum(path):
+    """Return the genome's checksum: the MD5 of the sorted MD5s of its sequences, or ""
+    if the file holds no sequence."""
+    hashes = sorted(hashlib.md5(sequence.encode("ascii", errors="replace")).hexdigest()
+                    for sequence in _read_fasta_sequences(path) if sequence)
+    if not hashes:
+        return ""
+    return hashlib.md5("\n".join(hashes).encode("ascii")).hexdigest()
+
+
+def find_identical_sequences(records, fasta_dir):
+    """Record each input MAG's checksum in sequence_md5, and set sequence_check to unique
+    or no_fasta_file. Returns the sets of identical genomes as {checksum: genomes};
+    choose_kept_copies() picks the kept copy after tracing."""
+    files, other_version = find_fasta_files(fasta_dir, records)
+    if other_version:
+        LOG.warning("%s FASTA file(s) in %s hold another version of the genome than ENA's "
+                    "current one and were not used, e.g. %s",
+                    _number(len(other_version)), fasta_dir, other_version[0])
+    for record in records:
+        record.sequence_check = SEQ_NO_FASTA_FILE
+    by_checksum = {}
+    for record, path in files:
+        try:
+            checksum = sequence_checksum(path)
+        except (OSError, EOFError) as exc:
+            LOG.warning("can't read %s: %s", path, exc)
+            continue
+        if not checksum:
+            LOG.warning("%s holds no sequence", path)
+            continue
+        record.sequence_md5 = checksum
+        by_checksum.setdefault(checksum, []).append(record)
+    for same in by_checksum.values():
+        if len(same) == 1:
+            same[0].sequence_check = SEQ_UNIQUE
+    return {checksum: same for checksum, same in by_checksum.items() if len(same) >= 2}
+
+
+def _kept_first(record):
+    """The order in which copies are chosen as the kept one: a traced copy first (only
+    traced genomes get a source group), then a copy from EMG, then a GCA before an ERZ
+    (the GCA is the INSDC accession, with a version), then the lowest accession."""
+    return (record.source_sample_status != STATUS_TRACED,
+            record.center_name != EBI_CENTER_NAME,
+            not record.genome_accession.startswith("GCA_"),
+            record.genome_accession)
+
+
+def choose_kept_copies(sets):
+    """After tracing, keep one copy of each set of identical genomes (see _kept_first) and
+    mark the others duplicate. Each set is sorted with the kept copy first."""
+    for same in sets.values():
+        same.sort(key=_kept_first)
+        same[0].sequence_check = SEQ_DUPLICATE_KEPT
+        for record in same[1:]:
+            record.sequence_check = SEQ_DUPLICATE
+
+
+def write_identical_sequences_tsv(path, sets):
+    """Write identical_sequences.tsv: one row per set of identical genomes, with the
+    kept genome listed first."""
+    rows = []
+    for checksum, same in sorted(sets.items(), key=lambda item: versioned(item[1][0])):
+        rows.append([checksum, versioned(same[0]), str(len(same)),
+                     _join(versioned(r) for r in same),
+                     _join(_dedupe(r.study_accession for r in same if r.study_accession))])
+    _write_tsv(path, IDENTICAL_COLUMNS, rows)
+
+
+# ---------------------------------------------------------------------------
 # Tracing each MAG sample back to its source samples (phase 1)
 # ---------------------------------------------------------------------------
 #
@@ -699,8 +857,8 @@ def _mark_non_mags(records):
 # When derived_from names several samples, each is followed, and the MAG gets all the
 # source samples they lead to.
 #
-# Each step back looks up the links of all MAG samples in the same requests (one search
-# for runs, one for the samples without runs), not separately for each MAG.
+# Each step looks up all MAG samples together (one search for runs, one for samples),
+# not one MAG at a time.
 
 SAMPLE_FIELDS = ["sample_accession", "secondary_sample_accession",
                  "related_sample_accession"]
@@ -869,7 +1027,7 @@ def trace_source_samples(client, mag_samples):
                       for parent in trace.to_look_up}
         if not step_links:
             break
-        LOG.debug("tracing source samples, step %s: looking up %s parent accession(s)",
+        LOG.debug("tracing source samples, step %s: looking up %s accession(s)",
                   depth, len(step_links))
 
         by_run, by_sample = _index_runs(
@@ -948,9 +1106,9 @@ def trace_source_samples(client, mag_samples):
 #
 # A source sample that is a range (e.g. ERS9142775-ERS9142786) is searched as written.
 #
-# A sample found this way that has no MAG (e.g. a bin or a co-assembly sample) is
-# searched from in the same way, because MAGs can name it instead of the source sample.
-# This goes up to MAX_TRACE_STEPS steps, as far as the trace goes back.
+# A sample found this way that has no MAG (e.g. a bin) becomes a search key in the next
+# step, because MAGs can name the bin instead of the source sample. This repeats for up
+# to MAX_TRACE_STEPS steps.
 
 def build_derived_from_query(keys):
     """Build the ENA search for samples whose derived_from names any of keys:
@@ -1048,14 +1206,14 @@ def find_genomes_of_samples(client, samples):
 # Genomes with exactly the same source samples form a source group. Only groups with
 # genomes from 2 or more studies can hold duplicates; phase 2 checks those.
 
-# Values of the duplicate_status column. Phase 1 sets to_compare, single_study or
-# no_source_group. Phase 2 looks again at the to_compare genomes and sets duplicate,
-# not_duplicate, other_study_no_cluster or no_cluster.
+# Values of the duplicate_status column. Phase 1 sets to_compare, single_study,
+# no_source_group or duplicate_sequence. Phase 2 looks again at the to_compare genomes
+# and sets duplicate, not_duplicate, other_study_no_cluster or no_cluster.
 #   duplicate               a genome from another study in its source group has the
 #                           same gemsparcl cluster
 #   not_duplicate           the genomes from other studies all have other clusters
-#   other_study_no_cluster  no match, but a genome from another study has no cluster,
-#                           so it could still be a duplicate
+#   other_study_no_cluster  no genome from another study has its cluster, but one has no
+#                           cluster, so this could still be a duplicate
 #   no_cluster              this genome is not in the gemsparcl clusters file
 #   to_compare              its source group has genomes from 2 or more studies, so it
 #                           is compared in phase 2
@@ -1063,6 +1221,8 @@ def find_genomes_of_samples(client, samples):
 #                           can't be a duplicate
 #   no_source_group         its source_sample_status is not traced, so it can't be
 #                           compared
+#   duplicate_sequence      has the same sequence as the duplicate_kept genome, which is
+#                           compared instead
 DUP_DUPLICATE = "duplicate"
 DUP_NOT_DUPLICATE = "not_duplicate"
 DUP_OTHER_STUDY_NO_CLUSTER = "other_study_no_cluster"
@@ -1070,6 +1230,7 @@ DUP_NO_CLUSTER = "no_cluster"
 DUP_TO_COMPARE = "to_compare"
 DUP_SINGLE_STUDY = "single_study"
 DUP_NO_SOURCE_GROUP = "no_source_group"
+DUP_DUPLICATE_SEQUENCE = "duplicate_sequence"
 
 
 def _short_id(prefix, items):
@@ -1079,8 +1240,8 @@ def _short_id(prefix, items):
 
 
 def fingerprint(source_samples):
-    """Return the source group id: "sg_" and the first 12 characters of the SHA-1 of the
-    sorted source samples, so the same samples always give the same id:
+    """Return the source group id, made from the sorted source samples, so the same
+    samples always give the same id:
 
         ["SAMEA2622837", "SAMEA2622733"] -> sg_3bd7455b797d
 
@@ -1092,9 +1253,13 @@ def fingerprint(source_samples):
 
 def build_source_groups(records):
     """Give every fully traced genome its source group id and its phase 1
-    duplicate_status. Returns {source_group_id: set of study accessions}."""
+    duplicate_status. Identical copies (sequence_check duplicate) get no group, so they
+    are not compared again. Returns {source_group_id: set of study accessions}."""
     for record in records:
-        if record.source_sample_status == STATUS_TRACED and record.source_samples:
+        if record.sequence_check == SEQ_DUPLICATE:
+            record.source_group_id = ""
+            record.duplicate_status = DUP_DUPLICATE_SEQUENCE
+        elif record.source_sample_status == STATUS_TRACED and record.source_samples:
             record.source_group_id = fingerprint(record.source_samples)
         else:
             record.source_group_id = ""
@@ -1141,7 +1306,7 @@ MAGS_COLUMNS = [
     "assembly_type",
     "tax_id", "scientific_name", "fasta_ftp",
     "gemsparcl_cluster",
-    "duplicate_status", "source_sample_status",
+    "duplicate_status", "source_sample_status", "sequence_check", "sequence_md5",
 ]
 
 
@@ -1242,7 +1407,25 @@ UNTRACEABLE_STATUSES = (STATUS_INVALID, STATUS_ACCESSION_NOT_FOUND, STATUS_NOT_A
                         STATUS_REPEATED_INPUT)
 
 
-def log_phase1_summary(records, studies_by_group_id, client):
+def _log_sequence_check(inputs, identical):
+    """Print step 1 of the phase 1 summary. identical holds the sets of identical genomes,
+    or is None without --fasta-dir."""
+    LOG.info("Step 1: compare the input genomes' sequences")
+    if identical is None:
+        LOG.info("  not run (no --fasta-dir)")
+        return
+    counts = Counter(r.sequence_check for r in inputs)
+    LOG.info("  sequence_check of the inputs:")
+    for value in (SEQ_UNIQUE, SEQ_DUPLICATE_KEPT, SEQ_DUPLICATE, SEQ_NO_FASTA_FILE):
+        note = ""
+        if value == SEQ_DUPLICATE_KEPT:
+            note = "one per set of identical sequences, in %s" % IDENTICAL_FILE
+        _log_row("  " + value, counts[value], note)
+
+
+def log_phase1_summary(records, studies_by_group_id, client, identical=None):
+    """Print the phase 1 summary. identical holds the sets of identical genomes, or is
+    None without --fasta-dir."""
     inputs = [r for r in records if r.input_accession]
     statuses = Counter(r.source_sample_status for r in inputs)
     traceable = sum(n for s, n in statuses.items() if s not in UNTRACEABLE_STATUSES)
@@ -1255,6 +1438,9 @@ def log_phase1_summary(records, studies_by_group_id, client):
     multi = sum(1 for studies in studies_by_group_id.values() if len(studies) >= 2)
 
     _log_row("input accessions", len(inputs))
+    _log_sequence_check(inputs, identical)
+    LOG.info("Step 2: trace genomes to their source samples, then find every genome "
+             "built from those samples (reverse lookup)")
     LOG.info("  source_sample_status of the inputs:")
     for status, count in statuses.most_common():
         _log_row("  " + status, count, rate if status == STATUS_TRACED else "")
@@ -1265,7 +1451,8 @@ def log_phase1_summary(records, studies_by_group_id, client):
     _log_row("ENA requests", client.request_count,
              "%s answered from the cache" % _number(client.cache_hits))
     _log_status_table("duplicate_status after phase 1", records,
-                      (DUP_TO_COMPARE, DUP_SINGLE_STUDY, DUP_NO_SOURCE_GROUP))
+                      (DUP_TO_COMPARE, DUP_SINGLE_STUDY, DUP_DUPLICATE_SEQUENCE,
+                       DUP_NO_SOURCE_GROUP))
 
 
 # ---------------------------------------------------------------------------
@@ -1475,21 +1662,29 @@ def _apply_trace(record, trace_result):
         record.source_sample_status = trace_result.status
 
 
-def run_pipeline(client, accessions, expand_enabled=True):
-    """Phase 1. Look up the input genomes, trace their samples to source samples, find
-    other genomes from those source samples (reverse lookup), trace those too, and build
-    the source groups. Returns (records, {source_group_id: studies}).
+def run_pipeline(client, accessions, expand_enabled=True, fasta_dir=None):
+    """Phase 1. Look up the input genomes, compare their sequences (with fasta_dir),
+    trace them to their source samples, keep one copy of each set of identical genomes,
+    find other genomes from the source samples (reverse lookup), trace those too, and
+    build the source groups. Returns the records, {source_group_id: studies}, and the
+    sets of identical genomes (None without fasta_dir).
     """
     records = lookup_genomes(client, accessions)
     inputs = [records[a.raw] for a in accessions]
-    for record in inputs:
-        if not record.source_sample_status and not record.mag_sample:
+    # Every input MAG is checked for identical sequences, including those that can't be
+    # traced because ENA lists no sample for them.
+    input_mags = [r for r in inputs if not r.source_sample_status]
+    identical = find_identical_sequences(input_mags, fasta_dir) if fasta_dir else None
+    for record in input_mags:
+        if not record.mag_sample:
             record.source_sample_status = STATUS_MAG_SAMPLE_NOT_FOUND
-    mags = [r for r in inputs if not r.source_sample_status]
+    mags = [r for r in input_mags if not r.source_sample_status]
 
     sources = trace_source_samples(client, [r.mag_sample for r in mags]) if mags else {}
     for record in mags:
         _apply_trace(record, sources.get(record.mag_sample))
+    if identical:
+        choose_kept_copies(identical)
 
     all_records = list(inputs)
     if expand_enabled and sources:
@@ -1502,24 +1697,29 @@ def run_pipeline(client, accessions, expand_enabled=True):
             _apply_trace(record, extra_sources.get(record.mag_sample))
         all_records.extend(found)
 
-    return all_records, build_source_groups(all_records)
+    return all_records, build_source_groups(all_records), identical
 
 
 def _phase1(args, client):
     LOG.info("")
-    LOG.info("Phase 1: trace genomes to their source samples, then find every genome "
-             "built from those samples (reverse lookup)")
+    LOG.info("Phase 1: provenance of the genomes in ENA")
     accessions = [classify_accession(a) for a in read_accessions(args.accessions)]
     if not accessions:
         LOG.error("no accessions found in %s", args.accessions)
         return 1
+    if args.fasta_dir and not os.path.isdir(args.fasta_dir):
+        LOG.error("%s is not a folder", args.fasta_dir)
+        return 1
 
-    records, studies_by_group_id = run_pipeline(client, accessions,
-                                                expand_enabled=not args.no_expand)
+    records, studies_by_group_id, identical = run_pipeline(
+        client, accessions, expand_enabled=not args.no_expand, fasta_dir=args.fasta_dir)
 
     write_mags_tsv(os.path.join(args.outdir, "mags.tsv"), records)
+    if identical is not None:
+        write_identical_sequences_tsv(os.path.join(args.outdir, IDENTICAL_FILE),
+                                      identical)
 
-    log_phase1_summary(records, studies_by_group_id, client)
+    log_phase1_summary(records, studies_by_group_id, client, identical)
     return 0
 
 
@@ -1562,9 +1762,10 @@ they come from the same source sample(s), are the same organism (same gemsparcl
 cluster) and were deposited by different studies.
 
 phases (give one option to run one phase, or both to run both in one go):
-  1. --accessions          look each genome up in ENA, follow its sample's derived_from
-                           links back to the source sample(s), then find every genome
-                           built from those samples (reverse lookup)
+  1. --accessions          look each genome up in ENA, compare their sequences (with
+                           --fasta-dir), follow each sample's derived_from links
+                           back to the source sample(s), then find every genome built
+                           from those samples (reverse lookup)
   2. --gemsparcl-clusters   read the gemsparcl clusters file and report the duplicates"""
 
 HELP_EPILOG = """\
@@ -1580,7 +1781,9 @@ examples:
 
 output files, in --outdir:
   mags.tsv                       one row per genome: source samples, study,
-                                 source_sample_status, duplicate_status
+                                 source_sample_status, duplicate_status, sequence_check
+  identical_sequences.tsv        with --fasta-dir: one row per set of input genomes
+                                 with identical sequences
   organism_check_candidates.tsv  genomes with no gemsparcl cluster, with a FASTA link;
                                  after phase 2 they can be run through gemsparcl query
   duplicates.tsv                 phase 2: one row per duplicate group
@@ -1606,6 +1809,11 @@ def build_arg_parser():
     parser.add_argument("--outdir", metavar="DIR", default="results",
                         help="folder for the output files; phase 2 reads mags.tsv from "
                              "here (default: %(default)s)")
+    parser.add_argument("--fasta-dir", metavar="DIR",
+                        help="phase 1: compare the input genomes' FASTA files in this "
+                             "folder (named by accession, e.g. GCA_937896655.1.fna.gz); "
+                             "of genomes with identical sequences, only one is "
+                             "compared further")
     parser.add_argument("--cache-dir", metavar="DIR",
                         help="keep ENA answers in this folder, so a rerun reuses them "
                              "instead of asking ENA again")
