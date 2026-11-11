@@ -440,8 +440,9 @@ class EnaClient:
 #   traced                every derived_from link led to a source sample
 #   partly_traced         some links led to source samples, but at least one did not, so
 #                         the genome gets no source group
-#   mag_sample_not_found  ENA lists no sample for the genome, or has no record of it
-#                         (e.g. reference genomes such as GCA_000001405)
+#   mag_sample_not_found  ENA lists no sample for the genome, or has no record of that
+#                         sample (e.g. reference genomes such as GCA_000001405, or NCBI
+#                         samples not yet in ENA, such as SAMN30429671)
 #   no_derived_from       the MAG sample's derived_from is empty or holds no accession
 #                         (e.g. "missing")
 #   source_not_found      derived_from names an accession, but no sample with runs was
@@ -637,8 +638,17 @@ def lookup_genomes(client, accessions):
     found = {}
     for kind in ENDPOINTS:
         queries = sorted({a.query for a in wanted if a.kind == kind})
-        if queries:
+        if not queries:
+            continue
+        if kind != KIND_WGS:
             found.update(_fetch_genomes(client, kind, accessions=queries))
+            continue
+        # ENA rejects a WGS set with a 4-letter prefix (e.g. NVUE02000000) in an accession
+        # list, with HTTP 400 for the whole request, but finds it with a query.
+        for start in range(0, len(queries), client.batch_size):
+            query = " OR ".join('accession="%s"' % q
+                                for q in queries[start:start + client.batch_size])
+            found.update(_fetch_genomes(client, kind, query=query))
 
     # The wgs_set endpoint has no center, software or quality fields, so a WGS set is
     # replaced by the record of its GCA (its assembly_accession).
