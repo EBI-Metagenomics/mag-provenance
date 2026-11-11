@@ -82,6 +82,11 @@ ANALYSES = {
     "ERZ9000013": ("", "PRJEB7", "SAMEA9200004", MAG, "ERR9000001"),
     "ERZ9000016": ("", "PRJEB9", "SAMEA9200006", "primary metagenome", ""),
 }
+# WGS set: its GCA. Sets with a 4-letter prefix are the older format.
+WGS_SETS = {
+    "ABCD01000000": "GCA_900000001",     # 4-letter prefix
+    "ABCDEF010000000": "GCA_900000003",  # 6-letter prefix
+}
 
 
 def _terms(query):
@@ -133,7 +138,14 @@ class FakeClient:
                     rows.append(row)
             return rows
         if result == "wgs_set":
-            return []
+            # Like ENA, reject a 4-letter WGS set in an accession list (HTTP 400 for the
+            # whole request), but find it with a query. A 4-letter set is 12 characters,
+            # e.g. ABCD01000000.
+            if any(len(a) == 12 for a in wanted):
+                raise m.EnaError("HTTP 400: accession(s) not valid for wgs_set")
+            named = {v for k, v in terms if k == "accession"}
+            return [{"accession": acc, "assembly_accession": gca}
+                    for acc, gca in WGS_SETS.items() if acc in wanted or acc in named]
         raise AssertionError(result)
 
 
@@ -304,6 +316,43 @@ class TestReverseLookupFromARun(TempDirTest):
 
     def test_finds_the_genome_naming_the_older_accession(self):
         self.assertIn("GCA_900000011.1", self.found)       # names ERS9000001
+
+
+# ---------------------------------------------------------------------------
+# WGS sets as input
+# ---------------------------------------------------------------------------
+
+class TestWgsSets(TempDirTest):
+    """ENA rejects a WGS set with a 4-letter prefix (e.g. NVUE02000000) in an accession
+    list, with HTTP 400 for the whole request, so the script looks WGS sets up with a
+    query. Otherwise one such line would stop the whole run. Both prefix lengths must be found and replaced by their GCA, and a WGS set ENA
+    doesn't have must get accession_not_found, not stop the run.
+
+        ABCD01     4-letter prefix, short form   -> GCA_900000001
+        ABCDEF01   6-letter prefix, short form   -> GCA_900000003
+        WXYZ01     not in ENA                    -> accession_not_found
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        accessions = os.path.join(cls.dir, "acc.txt")
+        write_lines(accessions, ["ABCD01", "ABCDEF01", "WXYZ01"])
+        cls.code, cls.screen = run_main(["--accessions", accessions, "--outdir", cls.dir,
+                                         "--no-expand"])
+        rows = read_tsv(os.path.join(cls.dir, "mags.tsv"))
+        cls.by_input = {r["input_accession"]: r for r in rows}
+
+    def test_exit_code(self):
+        self.assertEqual(self.code, 0, self.screen)
+
+    def test_both_prefix_lengths_are_replaced_by_their_gca(self):
+        self.assertEqual(self.by_input["ABCD01"]["genome_accession"], "GCA_900000001.1")
+        self.assertEqual(self.by_input["ABCDEF01"]["genome_accession"], "GCA_900000003.1")
+
+    def test_wgs_set_not_in_ena(self):
+        self.assertEqual(self.by_input["WXYZ01"]["source_sample_status"],
+                         "accession_not_found")
 
 
 # ---------------------------------------------------------------------------
