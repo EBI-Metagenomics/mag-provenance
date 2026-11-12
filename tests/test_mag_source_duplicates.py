@@ -278,13 +278,29 @@ class TestBothPhases(TempDirTest):
 
     def test_duplicates_tsv(self):
         dups = read_tsv(os.path.join(self.dir, "duplicates.tsv"))
-        runs = {d["gemsparcl_cluster"]: d["declared_runs"] for d in dups}
+        runs = {d["gemsparcl_cluster"]: d["declared_runs_match"] for d in dups}
         self.assertEqual(runs, {"c1": "same", "c2": "different", "c3": "unknown"})
         self.assertIn("center_names", dups[0])
 
     def test_candidates_after_phase_2(self):
         candidates = read_tsv(os.path.join(self.dir, "organism_check_candidates.tsv"))
         self.assertEqual([c["genome_accession"] for c in candidates], ["GCA_900000017.1"])
+
+    def test_mags_tsv_with_a_missing_column_stops_phase_2(self):
+        """A mags.tsv from an older version may lack a column. Read as empty, a missing
+        source_group_id would make phase 2 find no duplicates, with no error."""
+        out = os.path.join(self.dir, "older_version")
+        os.mkdir(out)
+        columns = [c for c in self.rows[0] if c != "source_group_id"]
+        write_lines(os.path.join(out, "mags.tsv"),
+                    ["\t".join(columns)]
+                    + ["\t".join(row[c] for c in columns) for row in self.rows])
+        code, screen = run_main(["--gemsparcl-clusters",
+                                 os.path.join(self.dir, "run_clusters.csv"),
+                                 "--outdir", out])
+        self.assertEqual(code, 1)
+        self.assertIn("Rerun phase 1", screen)
+        self.assertFalse(os.path.exists(os.path.join(out, "duplicates.tsv")))
 
 
 # ---------------------------------------------------------------------------
