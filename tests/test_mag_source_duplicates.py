@@ -341,8 +341,9 @@ class TestReverseLookupFromARun(TempDirTest):
 class TestWgsSets(TempDirTest):
     """ENA rejects a WGS set with a 4-letter prefix (e.g. NVUE02000000) in an accession
     list, with HTTP 400 for the whole request, so the script looks WGS sets up with a
-    query. Otherwise one such line would stop the whole run. Both prefix lengths must be found and replaced by their GCA, and a WGS set ENA
-    doesn't have must get accession_not_found, not stop the run.
+    query. Otherwise one such line would stop the whole run. Both prefix lengths must be
+    found and replaced by their GCA, and a WGS set ENA doesn't have must get
+    accession_not_found, not stop the run.
 
         ABCD01     4-letter prefix, short form   -> GCA_900000001
         ABCDEF01   6-letter prefix, short form   -> GCA_900000003

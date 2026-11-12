@@ -11,10 +11,7 @@ hold:
     2. they were deposited under different studies    (ENA metadata)
     3. they are the same organism                     (same gemsparcl cluster)
 
-A source sample is the sample that holds the sequencing runs a MAG was built from. A
-sample can have several runs (e.g. extra sequencing lanes), and ENA often does not say
-which of them a MAG used. So genomes from the same source sample count as coming from
-the same source data, even if they used different runs.
+A source sample is the sample that holds the sequencing runs a MAG was built from.
 
 The script works in two phases. You can run them one at a time, or both in one go by
 giving both options:
@@ -26,7 +23,7 @@ giving both options:
     with the same sequence are compared only once (see identical_sequences.tsv).
 
     Phase 2 (--gemsparcl-clusters) checks 3. Within each source group, genomes that
-    gemsparcl put in the same cluster become a duplicate group. Writes duplicates.tsv
+    gemsparcl assigned to the same cluster become a duplicate group. Writes duplicates.tsv
     and updates mags.tsv. Genomes in source groups with 2 or more studies that are not
     in the clusters file are listed in organism_check_candidates.tsv, so they can be run
     through `gemsparcl query`.
@@ -1056,7 +1053,8 @@ def trace_source_samples(client, mag_samples):
                         continue
                     # Look up the run's sample in the next step. That also gives the
                     # sample's other runs, which other MAGs may name instead: e.g.
-                    # SAMEA112376089 names ERR1614694, one of SAMEA4427029's 8 runs.
+                    # SAMEA112376089 (MAG sample) names ERR1614694, one of the 8 runs of
+                    # SAMEA4427029 (source sample).
                     trace.enqueue(ParentValue(_canonical_sample(row), PARENT_SAMPLE))
                     continue
                 rows = by_sample.get(parent.raw)
@@ -1216,23 +1214,26 @@ def find_genomes_of_samples(client, samples):
 # Genomes with exactly the same source samples form a source group. Only groups with
 # genomes from 2 or more studies can hold duplicates; phase 2 checks those.
 
-# Values of the duplicate_status column. Phase 1 sets to_compare, single_study,
-# no_source_group or duplicate_sequence. Phase 2 looks again at the to_compare genomes
-# and sets duplicate, not_duplicate, other_study_no_cluster or no_cluster.
-#   duplicate               a genome from another study in its source group has the
-#                           same gemsparcl cluster
-#   not_duplicate           the genomes from other studies all have other clusters
-#   other_study_no_cluster  no genome from another study has its cluster, but one has no
-#                           cluster, so this could still be a duplicate
-#   no_cluster              this genome is not in the gemsparcl clusters file
-#   to_compare              its source group has genomes from 2 or more studies, so it
-#                           is compared in phase 2
+# Values of the duplicate_status column.
+# Set in phase 1:
+#   to_compare              its source group has genomes from 2 or more studies, so
+#                           phase 2 compares it
 #   single_study            all genomes in its source group are from one study, so it
 #                           can't be a duplicate
-#   no_source_group         its source_sample_status is not traced, so it can't be
-#                           compared
-#   duplicate_sequence      has the same sequence as the duplicate_kept genome, which is
-#                           compared instead
+#   duplicate_sequence      it has the same sequence as another input genome (the one
+#                           with sequence_check duplicate_kept), which is compared instead
+#   no_source_group         its source_sample_status isn't traced, so it has no source
+#                           group and can't be compared
+# Set in phase 2, which replaces every to_compare with one of these. The other phase 1
+# values stay.
+#   duplicate               a genome from another study in its source group is in the
+#                           same gemsparcl cluster
+#   not_duplicate           every genome from another study in its source group is in
+#                           another cluster
+#   other_study_no_cluster  no genome from another study is in its cluster, but at least
+#                           one of them isn't in the clusters file, so this genome could
+#                           still be a duplicate
+#   no_cluster              this genome isn't in the gemsparcl clusters file
 DUP_DUPLICATE = "duplicate"
 DUP_NOT_DUPLICATE = "not_duplicate"
 DUP_OTHER_STUDY_NO_CLUSTER = "other_study_no_cluster"
@@ -1375,14 +1376,19 @@ def write_mags_tsv(path, records):
 
 
 def read_mags_tsv(path):
-    """Rebuild GenomeRecords from mags.tsv. A column with no GenomeRecord attribute of
-    the same name (e.g. one added by hand) is skipped."""
+    """Rebuild GenomeRecords from mags.tsv, for phase 2. The run stops if the columns
+    aren't the ones this script writes, for example in a mags.tsv from an older version:
+    a missing column would otherwise be read as empty for every genome."""
     types = {f.name: f.type for f in dataclass_fields(GenomeRecord)}
     records = []
     with open(path, newline="", encoding="utf-8") as handle:
-        for row in csv.DictReader(handle, delimiter="\t"):
+        reader = csv.DictReader(handle, delimiter="\t")
+        if reader.fieldnames != MAGS_COLUMNS:
+            raise ValueError("%s: the columns are not the ones this version of the script "
+                             "writes. Rerun phase 1." % path)
+        for row in reader:
             record = GenomeRecord(**{name: _from_cell(types[name], text or "")
-                                     for name, text in row.items() if name in types})
+                                     for name, text in row.items()})
             record.genome_accession, record.version = split_version(record.genome_accession)
             records.append(record)
     return records
@@ -1417,11 +1423,10 @@ UNTRACEABLE_STATUSES = (STATUS_INVALID, STATUS_ACCESSION_NOT_FOUND, STATUS_NOT_A
                         STATUS_REPEATED_INPUT)
 
 
-def _log_sequence_check(inputs, identical):
-    """Print step 1 of the phase 1 summary. identical holds the sets of identical genomes,
-    or is None without --fasta-dir."""
+def _log_sequence_check(inputs, fasta_checked):
+    """Print step 1 of the phase 1 summary: the sequence_check counts of the inputs."""
     LOG.info("Step 1: compare the input genomes' sequences")
-    if identical is None:
+    if not fasta_checked:
         LOG.info("  not run (no --fasta-dir)")
         return
     counts = Counter(r.sequence_check for r in inputs)
@@ -1433,9 +1438,8 @@ def _log_sequence_check(inputs, identical):
         _log_row("  " + value, counts[value], note)
 
 
-def log_phase1_summary(records, studies_by_group_id, client, identical=None):
-    """Print the phase 1 summary. identical holds the sets of identical genomes, or is
-    None without --fasta-dir."""
+def log_phase1_summary(records, studies_by_group_id, client, fasta_checked=False):
+    """Print the phase 1 summary. fasta_checked is True when --fasta-dir was given."""
     inputs = [r for r in records if r.input_accession]
     statuses = Counter(r.source_sample_status for r in inputs)
     traceable = sum(n for s, n in statuses.items() if s not in UNTRACEABLE_STATUSES)
@@ -1448,7 +1452,7 @@ def log_phase1_summary(records, studies_by_group_id, client, identical=None):
     multi = sum(1 for studies in studies_by_group_id.values() if len(studies) >= 2)
 
     _log_row("input accessions", len(inputs))
-    _log_sequence_check(inputs, identical)
+    _log_sequence_check(inputs, fasta_checked)
     LOG.info("Step 2: trace genomes to their source samples, then find every genome "
              "built from those samples (reverse lookup)")
     LOG.info("  source_sample_status of the inputs:")
@@ -1555,7 +1559,7 @@ CANDIDATE_COLUMNS = ["source_group_id", "genome_accession", "fasta_url"]
 
 DUPLICATES_COLUMNS = [
     "duplicate_id", "source_group_id", "gemsparcl_cluster", "n_genomes", "n_studies",
-    "declared_runs", "genomes", "studies", "center_names",
+    "declared_runs_match", "genomes", "studies", "center_names",
 ]
 
 
@@ -1569,18 +1573,20 @@ class DuplicateGroup:
     genomes: List[str]
     studies: List[str]
     center_names: List[str]
-    declared_runs: str
+    declared_runs_match: str
 
 
 def _compare_declared_runs(genomes):
-    """Compare the runs the genomes list in ENA (their declared_runs):
+    """Compare the runs the genomes list in ENA (their declared_runs), for the
+    declared_runs_match column of duplicates.tsv:
 
         same       every genome lists runs, and the lists are the same
         different  every genome lists runs, but the lists are not all the same
         unknown    at least one genome lists no runs
 
-    This is for the reader only. It does not decide whether genomes are duplicates,
-    because different runs of the same source sample count as the same source data."""
+    The result is for information only: it doesn't decide whether genomes are
+    duplicates, because different runs of the same source sample count as the same
+    source data."""
     run_sets = {frozenset(genome.declared_runs) for genome in genomes}
     if frozenset() in run_sets:
         return "unknown"
@@ -1593,13 +1599,13 @@ def _from_other_study(a, b):
 
 
 def _organism_verdict(record, members):
-    """The duplicate_status of one genome, given every genome in its source group."""
+    """Return the phase 2 duplicate_status of one genome (record): compare its gemsparcl
+    cluster with the clusters of the genomes from other studies in its source group."""
     if not record.gemsparcl_cluster:
         return DUP_NO_CLUSTER
     others = [m for m in members if _from_other_study(record, m)]
     if any(m.gemsparcl_cluster == record.gemsparcl_cluster for m in others):
         return DUP_DUPLICATE
-    # A genome from another study with no cluster yet could be the same organism.
     if any(not m.gemsparcl_cluster for m in others):
         return DUP_OTHER_STUDY_NO_CLUSTER
     return DUP_NOT_DUPLICATE
@@ -1634,7 +1640,7 @@ def assign_duplicates(records, studies_by_group_id):
                 genomes=sorted(versioned(r) for r in same),
                 studies=studies,
                 center_names=sorted({r.center_name for r in same if r.center_name}),
-                declared_runs=_compare_declared_runs(same),
+                declared_runs_match=_compare_declared_runs(same),
             ))
     return duplicates
 
@@ -1642,7 +1648,7 @@ def assign_duplicates(records, studies_by_group_id):
 def write_duplicates_tsv(path, duplicates):
     _write_tsv(path, DUPLICATES_COLUMNS, [
         [dup.duplicate_id, dup.source_group_id, dup.gemsparcl_cluster,
-         str(len(dup.genomes)), str(len(dup.studies)), dup.declared_runs,
+         str(len(dup.genomes)), str(len(dup.studies)), dup.declared_runs_match,
          _join(dup.genomes), _join(dup.studies), _join(dup.center_names)]
         for dup in sorted(duplicates, key=lambda d: d.duplicate_id)])
 
@@ -1729,7 +1735,8 @@ def _phase1(args, client):
         write_identical_sequences_tsv(os.path.join(args.outdir, IDENTICAL_FILE),
                                       identical)
 
-    log_phase1_summary(records, studies_by_group_id, client, identical)
+    log_phase1_summary(records, studies_by_group_id, client,
+                       fasta_checked=bool(args.fasta_dir))
     return 0
 
 
@@ -1776,7 +1783,7 @@ phases (give one option to run one phase, or both to run both in one go):
                            --fasta-dir), follow each sample's derived_from links
                            back to the source sample(s), then find every genome built
                            from those samples (reverse lookup)
-  2. --gemsparcl-clusters   read the gemsparcl clusters file and report the duplicates"""
+  2. --gemsparcl-clusters  read the gemsparcl clusters file and report the duplicates"""
 
 HELP_EPILOG = """\
 examples:
@@ -1797,12 +1804,13 @@ output files, in --outdir:
   organism_check_candidates.tsv  genomes with no gemsparcl cluster, with a FASTA link;
                                  after phase 2 they can be run through gemsparcl query
   duplicates.tsv                 phase 2: one row per duplicate group
-  mag_source_duplicates.log      what was printed on screen, for every run"""
+  mag_source_duplicates.log      what was printed on screen, plus the details of
+                                 each step, for every run"""
 
 
 def _help_formatter(prog):
-    """Keep the description and examples as written, give option names room so their
-    help starts on the same line, and wrap at 90 characters whatever the terminal width."""
+    """Lay out --help: the description and examples exactly as written, each option's
+    help on the same line as its name, and lines 90 characters wide on any terminal."""
     return argparse.RawDescriptionHelpFormatter(prog, max_help_position=30, width=90)
 
 
@@ -1835,7 +1843,8 @@ def build_arg_parser():
 
 
 class _MessageFormatter(logging.Formatter):
-    """Show only the message; warnings and errors also start with their level."""
+    """Print each message as it is, with "WARNING: " or "ERROR: " in front of warnings
+    and errors, e.g. ERROR: results/mags.tsv not found. Run phase 1 first (--accessions)."""
 
     def format(self, record):
         message = record.getMessage()
@@ -1862,8 +1871,8 @@ def _start_logging():
 
 
 def _start_log_file(path):
-    """Add every message, the step-by-step ones too, to the log file. Each run is
-    appended, because phase 1 and phase 2 are often run separately into one folder."""
+    """Write everything printed on screen to the log file, plus the details of each step,
+    which aren't printed."""
     if os.path.exists(path) and os.path.getsize(path):
         with open(path, "a", encoding="utf-8") as handle:
             handle.write("\n")  # a blank line between runs
