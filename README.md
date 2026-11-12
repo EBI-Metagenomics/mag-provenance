@@ -1,7 +1,7 @@
 # mag-provenance
 
 `mag_source_duplicates.py` finds duplicate MAGs in ENA: genomes from the same source
-data, deposited by different studies, that gemsparcl places in the same cluster.
+data, deposited by different studies, that gemsparcl assigns to the same cluster.
 
 The reads behind a MAG stay public in ENA, so another group can download the same reads,
 assemble and bin them again, and deposit the genomes under its own study. ENA then holds
@@ -12,8 +12,9 @@ separately overstates how many different genomes were recovered.
 
 ## Quick start
 
-You need Python 3.7 or newer (no extra packages) and access to the ENA website. Phase 2
-also needs a gemsparcl clusters file; the script doesn't run gemsparcl.
+You need Python 3.7 or newer (no extra packages). Phase 1 needs internet access to the
+[ENA Portal API](https://www.ebi.ac.uk/ena/portal/api/). Phase 2 needs a gemsparcl
+clusters file; the script doesn't run gemsparcl.
 
 ```bash
 # phase 1: look the genomes up in ENA; with --fasta-dir (optional), also find genomes
@@ -42,17 +43,17 @@ Genomes are duplicates when all three of these hold:
 |---|---|---|
 | 1 | They come from the same source data | they trace back to the same source samples in ENA |
 | 2 | Different studies deposited them | they have different study accessions |
-| 3 | They are the same organism | gemsparcl placed them in the same cluster |
+| 3 | They are the same organism | gemsparcl assigned them to the same cluster |
 
 The **source sample** is the sample that holds the sequencing runs a MAG was built from.
 A co-assembled MAG is built from several samples, so it has several source samples. Two
 genomes count as built from the same source data only when they have exactly the same
 set of source samples.
 
-The script compares samples, not runs. One sample can have several runs: SAMEA2620995 has
-ERR598947, ERR599131 and ERR10235166. ENA often doesn't say which of them a MAG used, so
-two genomes from SAMEA2620995 count as built from the same source data even if they used
-different runs.
+The script compares samples, not runs: two genomes from SAMEA2620995 count as built from
+the same source data even if they used different runs of it (ERR598947, ERR599131 or
+ERR10235166). The `declared_runs_match` column of `duplicates.tsv` shows whether the
+genomes in a duplicate group list the same runs in ENA.
 
 Genomes deposited by the same study are not counted as duplicates. The exception is
 genomes with the same sequence: with `--fasta-dir`, one copy is kept and the others get
@@ -208,10 +209,10 @@ All files are written to `--outdir`.
 | `source_group_id` | the source group the genomes share |
 | `gemsparcl_cluster` | the cluster the genomes share |
 | `n_genomes`, `n_studies` | how many genomes and studies are in the group |
-| `declared_runs` | whether the runs the genomes list in ENA are the same (below); for information only |
+| `declared_runs_match` | whether the runs the genomes list in ENA are the same (below); for information only |
 | `genomes`, `studies`, `center_names` | the genomes, their studies and the centers that submitted them |
 
-`declared_runs` is `same` when every genome lists runs and the lists are the same,
+`declared_runs_match` is `same` when every genome lists runs and the lists are the same,
 `different` when they all list runs but not the same ones, and `unknown` when at least
 one genome lists none. It doesn't decide anything, because different runs of the same
 source sample count as the same source data.
@@ -236,7 +237,7 @@ comparison). Every column and status value is described in
 ### `organism_check_candidates.tsv`
 
 Genomes in source groups used by 2 or more studies that have no gemsparcl cluster, so you
-can place them in the existing clusters with `gemsparcl query` after phase 2. Columns:
+can assign them to the existing clusters with `gemsparcl query` after phase 2. Columns:
 `source_group_id`, `genome_accession` and `fasta_url` (a download link).
 
 ---
@@ -296,8 +297,10 @@ left out.
   matches only `GCA_937896655.1`. If the clusters file has accessions without a version,
   `GCA_937896655` matches the version in `mags.tsv`, and a warning gives the number of
   genomes matched this way.
-- **Run phase 1 again after updating the script.** Phase 2 reads `mags.tsv`, and one
-  written by an older version may have other columns or statuses.
+- **Run phase 1 again after updating the script.** Phase 2 reads the `mags.tsv` that
+  phase 1 wrote. If that file comes from an older version of the script with other
+  columns, phase 2 stops with an error. If the columns are the same but a status was
+  renamed, phase 2 doesn't notice, and the old name stays in `mags.tsv`.
 
 ---
 
