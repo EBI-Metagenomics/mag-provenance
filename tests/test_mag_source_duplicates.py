@@ -168,8 +168,12 @@ def read_tsv(path):
 def run_main(args, client=FakeClient):
     """Run the script with a fake ENA and return (exit code, screen output)."""
     screen = io.StringIO()
+    code = 0
     with mock.patch.object(m, "EnaClient", client), contextlib.redirect_stderr(screen):
-        code = m.main(args)
+        try:
+            m.main(args)
+        except SystemExit as exc:
+            code = exc.code
     return code, screen.getvalue()
 
 
@@ -302,6 +306,172 @@ class TestBothPhases(TempDirTest):
         self.assertIn("Rerun phase 1", screen)
         self.assertFalse(os.path.exists(os.path.join(out, "duplicates.tsv")))
 
+    def test_no_phase_asked_for(self):
+        code, screen = run_main(["--outdir", os.path.join(self.dir, "no_phase")])
+        self.assertEqual(code, 2)
+        self.assertIn("give --accessions (phase 1) or --gemsparcl-clusters (phase 2)",
+                      screen)
+
+
+# ---------------------------------------------------------------------------
+# Ranges in derived_from
+# ---------------------------------------------------------------------------
+
+class TestExpandRange(unittest.TestCase):
+
+    def test_sample_range(self):
+        self.assertEqual(m.expand_range("ERS9142775-ERS9142777"),
+                         ["ERS9142775", "ERS9142776", "ERS9142777"])
+
+    def test_leading_zeros_are_kept(self):
+        self.assertEqual(m.expand_range("SAMD00202456-SAMD00202458"),
+                         ["SAMD00202456", "SAMD00202457", "SAMD00202458"])
+
+    def test_range_written_end_first(self):
+        self.assertEqual(m.expand_range("ERS9142777-ERS9142775"),
+                         ["ERS9142775", "ERS9142776", "ERS9142777"])
+
+    def test_long_range_is_not_expanded(self):
+        self.assertEqual(len(m.expand_range("ERS9000001-ERS9001000")), 1000)
+        self.assertEqual(m.expand_range("ERS9000001-ERS9001001"), [])
+        self.assertEqual(m.expand_range("ERS9000001-ERS9999999"), [])
+
+    def test_types_of_range(self):
+        for value, parent_type in [("SAMEA11496486-SAMEA11496497", m.PARENT_RANGE),
+                                   ("ERR7625732-ERR7625754", m.PARENT_RANGE),
+                                   # different prefixes: not a range
+                                   ("ERS9142775-SAMEA11496497", m.PARENT_UNPARSABLE)]:
+            with self.subTest(value):
+                self.assertEqual(m.classify_parent(value), parent_type)
+
+    def test_only_real_prefixes_are_accessions(self):
+        # ERS, SRS and DRS (ENA, NCBI, DDBJ) are real; RRS and RRR are not.
+        for value, parent_type in [("ERS492926", m.PARENT_SAMPLE),
+                                   ("SRR1614694", m.PARENT_RUN),
+                                   ("RRS492926", m.PARENT_UNPARSABLE),
+                                   ("RRR1614694", m.PARENT_UNPARSABLE)]:
+            with self.subTest(value):
+                self.assertEqual(m.classify_parent(value), parent_type)
+
+
+# ---------------------------------------------------------------------------
+# A sample with no runs that leads back to a sample already looked up
+# ---------------------------------------------------------------------------
+
+class TestSecondRouteToASample(unittest.TestCase):
+    """A MAG sample can reach its source sample by two routes: directly, and through a
+    bin made from the source sample. The bin (SAMEA9200002) has no runs, and its
+    derived_from names the source sample (SAMEA9000001), which this MAG has already
+    looked up, so tracing doesn't follow it again. The bin must not count as a dead
+    end: it leads to the source sample, so the MAG is traced, not partly_traced.
+
+        SAMEA9500001   SAMEA9000001;SAMEA9200002   the source, and a bin made from it
+        SAMEA9500002   SAMEA9200002;ERS9200002     both accessions of the bin
+        SAMEA9500003   ERS9300001-ERS9300002       two bins made from the source
+        SAMEA9600001   SAMEA9600002                a loop: SAMEA9600002 and SAMEA9600003
+                                                   name each other, and neither has runs
+    """
+    SAMPLES = {
+        "SAMEA9500001": ("ERS9500001",
+                         "SAMEA9000001:derived_from;SAMEA9200002:derived_from"),
+        "SAMEA9500002": ("ERS9500002", "SAMEA9200002:derived_from;ERS9200002:derived_from"),
+        "SAMEA9300001": ("ERS9300001", "SAMEA9000001:derived_from"),
+        "SAMEA9300002": ("ERS9300002", "SAMEA9000001:derived_from"),
+        "SAMEA9500003": ("ERS9500003", "ERS9300001-ERS9300002:derived_from"),
+        "SAMEA9600001": ("ERS9600001", "SAMEA9600002:derived_from"),
+        "SAMEA9600002": ("ERS9600002", "SAMEA9600003:derived_from"),
+        "SAMEA9600003": ("ERS9600003", "SAMEA9600002:derived_from"),
+    }
+
+    def trace(self, mag_sample):
+        with mock.patch.dict(SAMPLES, self.SAMPLES):
+            return m.trace_source_samples(FakeClient(), [mag_sample])[mag_sample]
+
+    def test_second_route_is_not_a_dead_end(self):
+        for mag_sample in ("SAMEA9500001", "SAMEA9500002", "SAMEA9500003"):
+            with self.subTest(mag_sample):
+                result = self.trace(mag_sample)
+                self.assertEqual(result.status, "traced")
+                self.assertEqual(result.source_samples, ["SAMEA9000001"])
+
+    def test_loop_without_runs(self):
+        self.assertEqual(self.trace("SAMEA9600001").status, "source_not_found")
+
+
+# Samples, runs and genomes for TestRanges.
+RANGE_SAMPLES = {
+    "SAMEA9400001": ("ERS9400001", ""),
+    "SAMEA9400002": ("ERS9400002", ""),
+    "SAMEA9410001": ("ERS9410001", "ERS9400001-ERS9400002:derived_from"),
+    "SAMEA9410002": ("ERS9410002",
+                     "SAMEA9400001:derived_from;SAMEA9400002:derived_from"),
+    "SAMEA9410003": ("ERS9410003", "ERS9400001-ERS9400002:derived_from"),
+    "SAMEA9410004": ("ERS9410004", "ERR9400001-ERR9400002:derived_from"),
+    "SAMEA9410005": ("ERS9410005", "ERS9400001-ERS9499999:derived_from"),
+    "SAMEA9410006": ("ERS9410006", "ERS9400001-ERS9499999:derived_from"),
+}
+RANGE_RUNS = [("ERR9400001", "SAMEA9400001", "ERS9400001"),
+              ("ERR9400002", "SAMEA9400002", "ERS9400002")]
+RANGE_ASSEMBLIES = {
+    "GCA_900000021": ("1", "PRJEB10", "SAMEA9410001", MAG, ""),  # range of samples
+    "GCA_900000022": ("1", "PRJEB11", "SAMEA9410002", MAG, ""),  # list of samples
+    "GCA_900000023": ("1", "PRJEB12", "SAMEA9410003", MAG, ""),  # not in the input list
+    "GCA_900000024": ("1", "PRJEB13", "SAMEA9410004", MAG, ""),  # range of runs
+    "GCA_900000025": ("1", "PRJEB14", "SAMEA9410005", MAG, ""),  # range too long
+    "GCA_900000026": ("1", "PRJEB14", "SAMEA9410006", MAG, ""),  # the same range
+}
+
+
+class TestRanges(TempDirTest):
+    """A MAG whose derived_from is a range gets the same source samples as a MAG that
+    lists the samples one by one, so the two are compared.
+
+        GCA_900000021   ERS9400001-ERS9400002       a range of samples
+        GCA_900000022   SAMEA9400001;SAMEA9400002   the same samples, listed
+        GCA_900000024   ERR9400001-ERR9400002       a range of their runs
+        GCA_900000023   ERS9400001-ERS9400002       not an input: found only by searching
+                                                    for the range as written
+        GCA_900000025   ERS9400001-ERS9499999       too long, so kept as written
+        GCA_900000026   ERS9400001-ERS9499999       the same range: still one warning
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        accessions = os.path.join(cls.dir, "acc.txt")
+        write_lines(accessions, ["GCA_900000021", "GCA_900000022", "GCA_900000024",
+                                 "GCA_900000025", "GCA_900000026"])
+        this = sys.modules[__name__]
+        with mock.patch.dict(SAMPLES, RANGE_SAMPLES), \
+                mock.patch.dict(ASSEMBLIES, RANGE_ASSEMBLIES), \
+                mock.patch.object(this, "RUNS", RUNS + RANGE_RUNS):
+            _, cls.screen = run_main(["--accessions", accessions,
+                                      "--outdir", cls.dir])
+        rows = read_tsv(os.path.join(cls.dir, "mags.tsv"))
+        cls.by_genome = {r["genome_accession"]: r for r in rows}
+
+    def test_range_list_and_run_range_share_a_source_group(self):
+        group = m.fingerprint(["SAMEA9400001", "SAMEA9400002"])
+        for genome in ("GCA_900000021.1", "GCA_900000022.1", "GCA_900000024.1"):
+            with self.subTest(genome):
+                row = self.by_genome[genome]
+                self.assertEqual(row["source_sample_status"], "traced")
+                self.assertEqual(row["source_samples"], "SAMEA9400001,SAMEA9400002")
+                self.assertEqual(row["source_group_id"], group)
+
+    def test_reverse_lookup_finds_a_genome_naming_the_same_range(self):
+        row = self.by_genome["GCA_900000023.1"]
+        self.assertEqual(row["input_accession"], "")
+        self.assertEqual(row["source_samples"], "SAMEA9400001,SAMEA9400002")
+
+    def test_long_range_is_kept_as_written(self):
+        row = self.by_genome["GCA_900000025.1"]
+        self.assertEqual(row["source_samples"], "ERS9400001-ERS9499999")
+        self.assertIn("range ERS9400001-ERS9499999 in derived_from has more than",
+                      self.screen)
+        self.assertEqual(self.screen.count("range ERS9400001-ERS9499999"), 1)
+        self.assertIn("(named by 2 MAG sample(s))", self.screen)
+
 
 # ---------------------------------------------------------------------------
 # Reverse lookup from a MAG that names one run
@@ -317,21 +487,16 @@ class TestReverseLookupFromARun(TempDirTest):
         super().setUpClass()
         accessions = os.path.join(cls.dir, "acc.txt")
         write_lines(accessions, ["GCA_900000002"])
-        cls.code, _ = run_main(["--accessions", accessions, "--outdir", cls.dir])
+        run_main(["--accessions", accessions, "--outdir", cls.dir])
         rows = read_tsv(os.path.join(cls.dir, "mags.tsv"))
         cls.found = {r["genome_accession"] for r in rows if not r["input_accession"]}
 
-    def test_exit_code(self):
-        self.assertEqual(self.code, 0)
-
-    def test_finds_the_genome_naming_the_other_run(self):
-        self.assertIn("ERZ9000013", self.found)            # names ERR9000001
-
-    def test_finds_the_genome_naming_the_sample(self):
-        self.assertIn("GCA_900000001.1", self.found)       # names SAMEA9000001
-
-    def test_finds_the_genome_naming_the_older_accession(self):
-        self.assertIn("GCA_900000011.1", self.found)       # names ERS9000001
+    def test_finds_every_genome_from_the_source_sample(self):
+        for genome, names in [("ERZ9000013", "the other run, ERR9000001"),
+                              ("GCA_900000001.1", "the sample, SAMEA9000001"),
+                              ("GCA_900000011.1", "its older accession, ERS9000001")]:
+            with self.subTest(names):
+                self.assertIn(genome, self.found)
 
 
 # ---------------------------------------------------------------------------
@@ -355,13 +520,10 @@ class TestWgsSets(TempDirTest):
         super().setUpClass()
         accessions = os.path.join(cls.dir, "acc.txt")
         write_lines(accessions, ["ABCD01", "ABCDEF01", "WXYZ01"])
-        cls.code, cls.screen = run_main(["--accessions", accessions, "--outdir", cls.dir,
+        _, cls.screen = run_main(["--accessions", accessions, "--outdir", cls.dir,
                                          "--no-expand"])
         rows = read_tsv(os.path.join(cls.dir, "mags.tsv"))
         cls.by_input = {r["input_accession"]: r for r in rows}
-
-    def test_exit_code(self):
-        self.assertEqual(self.code, 0, self.screen)
 
     def test_both_prefix_lengths_are_replaced_by_their_gca(self):
         self.assertEqual(self.by_input["ABCD01"]["genome_accession"], "GCA_900000001.1")
@@ -425,7 +587,7 @@ class TestIdenticalSequences(TempDirTest):
                                "GCA_900000012.1,c1", "GCA_900000001.1,c1",
                                "GCA_900000002.1,c1"])
         cls.out = os.path.join(cls.dir, "res")
-        cls.code, cls.screen = run_main(
+        _, cls.screen = run_main(
             ["--accessions", cls.accessions, "--fasta-dir", cls.fasta,
              "--gemsparcl-clusters", clusters, "--outdir", cls.out], client=EbiFakeClient)
         rows = read_tsv(os.path.join(cls.out, "mags.tsv"))
@@ -434,9 +596,6 @@ class TestIdenticalSequences(TempDirTest):
 
     def column(self, accession, name):
         return self.by_input[accession][name]
-
-    def test_exit_code(self):
-        self.assertEqual(self.code, 0)
 
     def test_checksum_ignores_headers_order_line_breaks_case_and_gzip(self):
         self.assertEqual(m.sequence_checksum(self.f1), m.sequence_checksum(self.f2))
@@ -588,19 +747,15 @@ class TestEnaRequests(unittest.TestCase):
                 with self.assertRaisesRegex(m.EnaError, "ENA rejected the request"):
                     self.ask([http_error(code), ROWS])
 
-    def test_server_error_is_retried(self):
-        rows, network = self.ask([http_error(503), ROWS])
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(len(network.sent), 2)
-
-    def test_error_inside_a_normal_answer_is_retried(self):
-        rows, network = self.ask(["ERROR occurred while searching", ROWS])
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(len(network.sent), 2)
-
-    def test_network_failure_is_retried(self):
-        rows, network = self.ask([OSError("timed out"), ROWS])
-        self.assertEqual(len(rows), 1)
+    def test_temporary_failure_is_retried(self):
+        for outcome in (http_error(503), "ERROR occurred while searching",
+                        OSError("timed out")):
+            with self.subTest(repr(outcome)):
+                client = m.EnaClient(retry_wait=0)
+                rows, network = self.ask([outcome, ROWS], client=client)
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(len(network.sent), 2)
+                self.assertEqual(client.request_count, 2)  # every attempt is counted
 
     def test_failure_after_every_attempt_stops_the_run(self):
         # So a failure is never read as "ENA found nothing".
@@ -612,11 +767,6 @@ class TestEnaRequests(unittest.TestCase):
                     with self.assertRaisesRegex(m.EnaError, "failed after 4 attempts"):
                         client.search("sample", ["sample_accession"], query="x")
                 self.assertEqual(len(network.sent), client.max_retries)
-
-    def test_every_attempt_is_counted(self):
-        client = m.EnaClient(retry_wait=0)
-        self.ask([http_error(500), ROWS], client=client)
-        self.assertEqual(client.request_count, 2)
 
     def test_cache_answers_the_same_request_again(self):
         with tempfile.TemporaryDirectory() as cache:
