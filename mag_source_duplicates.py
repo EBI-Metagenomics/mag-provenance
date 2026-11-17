@@ -46,40 +46,35 @@ import urllib.parse
 import urllib.request
 from collections import Counter
 from dataclasses import dataclass, field, fields as dataclass_fields, replace
-from typing import List, Set
+from typing import (Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple,
+                    Union)
 
 LOG = logging.getLogger("mag_source_duplicates")
 LOG_FILE = "mag_source_duplicates.log"
 
 
-def _dedupe(items):
+def _dedupe(items: Iterable[str]) -> List[str]:
     """Remove duplicates but keep the original order, so output is the same on every run."""
-    seen = set()
-    out = []
-    for item in items:
-        if item not in seen:
-            seen.add(item)
-            out.append(item)
-    return out
+    return list(dict.fromkeys(items))
 
 
 # ---------------------------------------------------------------------------
 # Input accessions (phase 1)
 # ---------------------------------------------------------------------------
 
-KIND_GCA = "GCA"
-KIND_ERZ = "ERZ"
-KIND_WGS = "WGS"
-KIND_INVALID = "invalid"
+TYPE_GCA = "GCA"
+TYPE_ERZ = "ERZ"
+TYPE_WGS = "WGS"
+TYPE_INVALID = "invalid"
 
 # A WGS set is a 4- or 6-letter prefix, a 2-digit version, then zeros. ENA rejects the
 # short form (CALBOS01), so we pad it.
 # GCF_ (RefSeq) is not accepted: ENA does not hold RefSeq, and one GCF_ in a batch makes
 # ENA reject the whole batch.
-RE_GCA = re.compile(r"^GCA_[0-9]{9}$")
-RE_ERZ = re.compile(r"^ERZ[0-9]+$")
-RE_WGS_PADDED = re.compile(r"^[A-Z]{4}([A-Z]{2})?[0-9]{2}0{6,9}$")
-RE_WGS_SHORT = re.compile(r"^[A-Z]{4}([A-Z]{2})?[0-9]{2}$")
+RE_GCA_ACCESSION = re.compile(r"^GCA_[0-9]{9}$")
+RE_ERZ_ACCESSION = re.compile(r"^ERZ[0-9]+$")
+RE_WGS_ACCESSION = re.compile(r"^[A-Z]{4}([A-Z]{2})?[0-9]{2}0{6,9}$")
+RE_WGS_ACCESSION_SHORT = re.compile(r"^[A-Z]{4}([A-Z]{2})?[0-9]{2}$")
 
 # Zeros to add to a short WGS accession, by its length: AAAA02 -> AAAA02000000,
 # CALBOS01 -> CALBOS010000000.
@@ -88,15 +83,15 @@ WGS_PAD = {6: "0" * 6, 8: "0" * 7}
 
 @dataclass(frozen=True)
 class Accession:
-    """One input line: what the user wrote (raw), its kind (GCA, ERZ, WGS or invalid), and
+    """One input line: what the user wrote (raw), its type (GCA, ERZ, WGS or invalid), and
     the form sent to ENA (query)."""
 
     raw: str
-    kind: str
+    accession_type: str
     query: str
 
 
-def classify_accession(raw):
+def classify_accession(raw: str) -> Accession:
     """Check one line of the accessions file and return the accession to send to ENA.
 
     Accepted: a GCA assembly, an ERZ analysis, or a WGS set. Examples:
@@ -105,26 +100,22 @@ def classify_accession(raw):
         ERZ21930252      -> ERZ21930252
         CALBOS01         -> CALBOS010000000  padded with zeros; ENA rejects the short form
 
-    Anything else, such as a typo or a GCF_ accession, gets kind "invalid". The run carries
+    Anything else, such as a typo or a GCF_ accession, gets type "invalid". The run carries
     on, and the line appears in mags.tsv as invalid_accession.
     """
-    original = raw.strip() if raw else ""
-    token = original.upper()
-    if not token:
-        return Accession(raw=original, kind=KIND_INVALID, query="")
+    original = raw.strip()
+    unversioned = split_version(original.upper())[0]
 
-    unversioned = split_version(token)[0]
-
-    if RE_GCA.match(unversioned):
-        return Accession(raw=original, kind=KIND_GCA, query=unversioned)
-    if RE_ERZ.match(unversioned):
-        return Accession(raw=original, kind=KIND_ERZ, query=unversioned)
-    if RE_WGS_PADDED.match(unversioned):
-        return Accession(raw=original, kind=KIND_WGS, query=unversioned)
-    if RE_WGS_SHORT.match(unversioned):
-        return Accession(raw=original, kind=KIND_WGS,
+    if RE_GCA_ACCESSION.match(unversioned):
+        return Accession(raw=original, accession_type=TYPE_GCA, query=unversioned)
+    if RE_ERZ_ACCESSION.match(unversioned):
+        return Accession(raw=original, accession_type=TYPE_ERZ, query=unversioned)
+    if RE_WGS_ACCESSION.match(unversioned):
+        return Accession(raw=original, accession_type=TYPE_WGS, query=unversioned)
+    if RE_WGS_ACCESSION_SHORT.match(unversioned):
+        return Accession(raw=original, accession_type=TYPE_WGS,
                          query=unversioned + WGS_PAD[len(unversioned)])
-    return Accession(raw=original, kind=KIND_INVALID, query="")
+    return Accession(raw=original, accession_type=TYPE_INVALID, query="")
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +127,7 @@ def classify_accession(raw):
 #
 #     SAMEA2622837:derived_from;SAMEA2622733:derived_from
 #
-# Submitters fill this in by hand, so the accessions come in four shapes:
+# Submitters fill this in by hand, so the accessions come in four types:
 #
 #   SAMEA2622837            a BioSample, the usual case
 #   ERS492926               the same sample under its older ENA accession. A search for one
@@ -144,9 +135,11 @@ def classify_accession(raw):
 #                           search with both.
 #   ERR982800               a sequencing run instead of a sample. We look up which
 #                           sample the run belongs to.
-#   ERS9142775-ERS9142786   a range of samples. Kept exactly as written, not expanded,
-#                           because we can't be sure the submitter used every sample
-#                           in between.
+#   ERS9142775-ERS9142786   a range: all 12 samples from ERS9142775 to ERS9142786.
+#                           ENA's form for MAG samples (checklist ERC000047) allows
+#                           ranges of samples or of runs. We trace each one. A range
+#                           longer than MAX_RANGE_SIZE is kept as written, as one
+#                           source sample.
 #
 # A MAG assembled from several samples lists all of them, in no fixed order.
 
@@ -157,18 +150,24 @@ PARENT_UNPARSABLE = "unparsable"
 
 RELATION_DERIVED_FROM = "derived_from"
 
-# What each kind of value in a derived_from field looks like:
+# What each type of value in a derived_from field looks like:
 #   RE_BIOSAMPLE   SAMEA2622837, SAMN39623922, SAMD00202456 (same pattern ENA uses)
 #   RE_SECONDARY   ERS492926, also SRS... and DRS...
 #   RE_RUN         ERR982800, also SRR... and DRR...
-#   RE_RANGE       ERS9142775-ERS9142786
+#   RE_RANGE       ERS9142775-ERS9142786, SAMEA11496486-SAMEA11496497 or
+#                  ERR7625732-ERR7625754: the same prefix on both sides
 # The patterns are strict because these values are sent to ENA up to 500 per request,
 # and a single malformed one (e.g. SAMN3962392, which is SAMN39623922 with a digit
 # missing) makes ENA reject the whole request with HTTP 400.
 RE_BIOSAMPLE = re.compile(r"^(SAMEA?[0-9]{6,}|SAM[ND][0-9]{8})$")
-RE_SECONDARY = re.compile(r"^[EDSR]RS[0-9]{6,}$")
-RE_RUN = re.compile(r"^[EDSR]RR[0-9]{6,}$")
-RE_RANGE = re.compile(r"^[EDSR]RS[0-9]{6,}-[EDSR]RS[0-9]{6,}$")
+RE_SECONDARY = re.compile(r"^[EDS]RS[0-9]{6,}$")
+RE_RUN = re.compile(r"^[EDS]RR[0-9]{6,}$")
+RE_RANGE = re.compile(r"^([EDS]R[SR]|SAMEA?|SAM[ND])([0-9]{6,})-\1([0-9]{6,})$")
+
+# The most accessions a range is expanded into, so a typo such as
+# ERS9142775-ERS9942786 can't send thousands of requests to ENA. A longer range is
+# kept as written, as one source sample, with a warning.
+MAX_RANGE_SIZE = 1000
 
 # Spaces, tabs and quotes that submitters sometimes leave around a value,
 # e.g. ' "SAMEA2622837" '.
@@ -177,19 +176,20 @@ _STRIP_CHARS = ' \t"\''
 
 @dataclass(frozen=True)
 class ParentValue:
-    """One derived_from value as written (raw), and its shape (kind): PARENT_SAMPLE,
+    """One derived_from value as written (raw), and its type (parent_type): PARENT_SAMPLE,
     PARENT_RUN, PARENT_RANGE or PARENT_UNPARSABLE."""
 
     raw: str
-    kind: str
+    parent_type: str
 
 
-def classify_parent(token):
-    """Return the shape of one derived_from value:
+def classify_parent(token: str) -> str:
+    """Return the type of one derived_from value:
 
         SAMEA2622837, ERS492926   -> PARENT_SAMPLE
         ERR982800                 -> PARENT_RUN         its sample is looked up later
-        ERS9142775-ERS9142786     -> PARENT_RANGE       kept as written, not expanded
+        ERS9142775-ERS9142786     -> PARENT_RANGE       expanded into samples or runs
+                                                       when traced
         anything else             -> PARENT_UNPARSABLE
     """
     if RE_BIOSAMPLE.match(token) or RE_SECONDARY.match(token):
@@ -201,7 +201,25 @@ def classify_parent(token):
     return PARENT_UNPARSABLE
 
 
-def parse_related_field(value):
+def expand_range(token: str) -> List[str]:
+    """Return every accession in a range, or [] if it has more than MAX_RANGE_SIZE
+    accessions:
+
+        ERS9142775-ERS9142777      -> ["ERS9142775", "ERS9142776", "ERS9142777"]
+        ERS9142777-ERS9142775      -> the same (written end first)
+        SAMD00202456-SAMD00202458  -> ["SAMD00202456", "SAMD00202457", "SAMD00202458"]
+                                      (leading zeros kept)
+    """
+    prefix, first, last = RE_RANGE.match(token).groups()
+    if int(last) < int(first):
+        first, last = last, first
+    start, end = int(first), int(last)
+    if end - start + 1 > MAX_RANGE_SIZE:
+        return []
+    return ["%s%0*d" % (prefix, len(first), number) for number in range(start, end + 1)]
+
+
+def parse_related_field(value: Optional[str]) -> List[ParentValue]:
     """Return the derived_from values of a related_sample_accession field.
 
         "SAMEA2622837:derived_from;SAMEA2622733:derived_from"
@@ -211,8 +229,8 @@ def parse_related_field(value):
     Entries with any other relation are skipped. Values keep the order they were written
     in (fingerprint() sorts them later).
 
-    A value of no known shape is kept as PARENT_UNPARSABLE, so the MAG can't look fully
-    traced: it becomes partly_traced, or gets a status that says why.
+    A value that isn't an accession, such as "missing", is kept as PARENT_UNPARSABLE,
+    so the MAG is never marked traced: at best it is partly_traced.
     """
     if not value:
         return []
@@ -225,7 +243,7 @@ def parse_related_field(value):
         token = token.strip(_STRIP_CHARS)
         if found_relation.strip(_STRIP_CHARS) != RELATION_DERIVED_FROM or not token:
             continue
-        out.append(ParentValue(raw=token, kind=classify_parent(token)))
+        out.append(ParentValue(raw=token, parent_type=classify_parent(token)))
     return out
 
 
@@ -251,6 +269,9 @@ ENA_ERROR_MARKER = "ERROR occurred"
 # retried.
 PERMANENT_HTTP_CODES = frozenset({400, 404, 414})
 
+# One row of an ENA answer: {field name: value}.
+Row = Dict[str, str]
+
 
 class EnaError(RuntimeError):
     """A request ENA rejected, or one that still failed after all retries. The run stops
@@ -260,13 +281,13 @@ class EnaError(RuntimeError):
 class EnaHttpError(Exception):
     """An HTTP error status from ENA. EnaClient uses the code to decide whether to retry."""
 
-    def __init__(self, status_code, body=""):
+    def __init__(self, status_code: int, body: str = "") -> None:
         super().__init__("HTTP %s" % status_code)
         self.status_code = status_code
         self.body = body
 
 
-def _http_post(url, data, timeout):
+def _http_post(url: str, data: Dict[str, str], timeout: float) -> str:
     """POST form data and return the response text. An HTTP error status raises
     EnaHttpError."""
     request = urllib.request.Request(url, data=urllib.parse.urlencode(data).encode("utf-8"))
@@ -281,7 +302,7 @@ def _http_post(url, data, timeout):
         raise EnaHttpError(exc.code, body)
 
 
-def split_accessions_by_form(accessions):
+def split_accessions_by_form(accessions: Iterable[str]) -> List[List[str]]:
     """Split accessions into the groups ENA accepts together in one request:
 
         SAMEA2622837, SAMN39623922    BioSample accessions
@@ -310,8 +331,9 @@ class EnaClient:
     and cache_hits are shown in the phase 1 summary.
     """
 
-    def __init__(self, cache_dir=None, timeout=180, max_retries=4, retry_wait=5.0,
-                 batch_size=500):
+    def __init__(self, cache_dir: Optional[str] = None, timeout: float = 180,
+                 max_retries: int = 4, retry_wait: float = 5.0,
+                 batch_size: int = 500) -> None:
         self.cache_dir = cache_dir
         self.timeout = timeout
         self.max_retries = max_retries
@@ -322,7 +344,7 @@ class EnaClient:
         if self.cache_dir:
             os.makedirs(self.cache_dir, exist_ok=True)
 
-    def _cache_path(self, payload):
+    def _cache_path(self, payload: Dict[str, str]) -> Optional[str]:
         """The cache file for this request, or None when there is no cache. Its name is the
         SHA-256 of the request, so the same request always maps to the same file."""
         if not self.cache_dir:
@@ -331,7 +353,7 @@ class EnaClient:
         digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
         return os.path.join(self.cache_dir, digest + ".tsv")
 
-    def _post(self, payload):
+    def _post(self, payload: Dict[str, str]) -> str:
         """Send one request and return ENA's answer as text. Reads the cache first if there
         is one. Raises EnaError if the request is rejected or still fails after all
         retries."""
@@ -383,7 +405,7 @@ class EnaClient:
                        % (self.max_retries, payload.get("result"), last_error))
 
     @staticmethod
-    def _parse_tsv(text):
+    def _parse_tsv(text: str) -> List[Row]:
         """Turn ENA's TSV answer into one dict per row, keyed by the header line. A row with
         fewer values than the header is padded with "" so it is kept."""
         lines = [line for line in text.split("\n") if line.strip()]
@@ -397,7 +419,8 @@ class EnaClient:
             rows.append(dict(zip(header, values)))
         return rows
 
-    def search(self, result, fields, query=None, accessions=None):
+    def search(self, result: str, fields: List[str], query: Optional[str] = None,
+               accessions: Optional[Iterable[str]] = None) -> List[Row]:
         """Search one ENA result type (e.g. "assembly", "sample") and return every row as a
         dict with the requested fields.
 
@@ -539,14 +562,20 @@ class GenomeRecord:
     sequence_md5: str = ""
 
 
-# Where to look up each kind of input accession: (ENA endpoint, fields to request, column
+# {source_group_id: the study accessions of its genomes}
+StudiesByGroup = Dict[str, Set[str]]
+# {checksum: the genomes with that sequence}, for sets of 2 or more identical genomes
+IdenticalSets = Dict[str, List[GenomeRecord]]
+
+
+# Where to look up each type of input accession: (ENA endpoint, fields to request, column
 # that holds the accession). For example, ERZ21930252 is searched in "analysis" and comes
 # back in the "analysis_accession" column. An accession sent to the wrong endpoint gets
 # HTTP 400.
 ENDPOINTS = {
-    KIND_GCA: ("assembly", ASSEMBLY_FIELDS, "accession"),
-    KIND_ERZ: ("analysis", ANALYSIS_FIELDS, "analysis_accession"),
-    KIND_WGS: ("wgs_set", WGS_FIELDS, "accession"),
+    TYPE_GCA: ("assembly", ASSEMBLY_FIELDS, "accession"),
+    TYPE_ERZ: ("analysis", ANALYSIS_FIELDS, "analysis_accession"),
+    TYPE_WGS: ("wgs_set", WGS_FIELDS, "accession"),
 }
 
 
@@ -562,7 +591,7 @@ _RENAMED_FIELDS = {
 }
 
 
-def _row_to_record(row, acc_key):
+def _row_to_record(row: Row, acc_key: str) -> GenomeRecord:
     """Turn one row from the assembly, analysis or wgs_set endpoint into a GenomeRecord.
 
     source_sample_status starts empty, and is set later to not_a_mag or to the result of
@@ -583,7 +612,7 @@ def _row_to_record(row, acc_key):
     )
 
 
-def _version_key(value):
+def _version_key(value: Optional[str]) -> int:
     """Turn a version into a number, so version 10 counts as newer than 9 (as text, "10"
     sorts before "9"). A missing version gives -1."""
     try:
@@ -592,14 +621,16 @@ def _version_key(value):
         return -1
 
 
-def _fetch_genomes(client, kind, accessions=None, query=None):
-    """Fetch genomes of one kind (KIND_GCA, KIND_ERZ or KIND_WGS) by accession list or
+def _fetch_genomes(client: EnaClient, accession_type: str,
+                   accessions: Optional[List[str]] = None,
+                   query: Optional[str] = None) -> Dict[str, GenomeRecord]:
+    """Fetch genomes of one type (TYPE_GCA, TYPE_ERZ or TYPE_WGS) by accession list or
     search query.
 
     ENA returns one row per version; only the latest is kept. Returns
     {unversioned accession: GenomeRecord}.
     """
-    result, fields, acc_key = ENDPOINTS[kind]
+    result, fields, acc_key = ENDPOINTS[accession_type]
     latest = {}
     for row in client.search(result, fields, query=query, accessions=accessions):
         record = _row_to_record(row, acc_key)
@@ -609,7 +640,8 @@ def _fetch_genomes(client, kind, accessions=None, query=None):
     return latest
 
 
-def lookup_genomes(client, accessions):
+def lookup_genomes(client: EnaClient, accessions: List[Accession]
+                   ) -> Dict[str, GenomeRecord]:
     """Look up every input accession in ENA.
 
     Returns {input line: GenomeRecord}, one per line. A line that can't be looked up
@@ -619,7 +651,7 @@ def lookup_genomes(client, accessions):
     records = {}
     wanted = []
     for accession in accessions:
-        if accession.kind == KIND_INVALID:
+        if accession.accession_type == TYPE_INVALID:
             records[accession.raw] = GenomeRecord(
                 genome_accession=accession.raw,
                 input_accession=accession.raw,
@@ -633,28 +665,28 @@ def lookup_genomes(client, accessions):
 
     # Look up each distinct accession once: {accession sent to ENA: record}.
     found = {}
-    for kind in ENDPOINTS:
-        queries = sorted({a.query for a in wanted if a.kind == kind})
+    for accession_type in ENDPOINTS:
+        queries = sorted({a.query for a in wanted if a.accession_type == accession_type})
         if not queries:
             continue
-        if kind != KIND_WGS:
-            found.update(_fetch_genomes(client, kind, accessions=queries))
+        if accession_type != TYPE_WGS:
+            found.update(_fetch_genomes(client, accession_type, accessions=queries))
             continue
         # ENA rejects a WGS set with a 4-letter prefix (e.g. NVUE02000000) in an accession
         # list, with HTTP 400 for the whole request, but finds it with a query.
         for start in range(0, len(queries), client.batch_size):
             query = " OR ".join('accession="%s"' % q
                                 for q in queries[start:start + client.batch_size])
-            found.update(_fetch_genomes(client, kind, query=query))
+            found.update(_fetch_genomes(client, accession_type, query=query))
 
     # The wgs_set endpoint has no center, software or quality fields, so a WGS set is
     # replaced by the record of its GCA (its assembly_accession).
     wgs_gcas = {a.query: found[a.query].assembly_accession.strip()
                 for a in wanted
-                if a.kind == KIND_WGS and a.query in found
+                if a.accession_type == TYPE_WGS and a.query in found
                 and found[a.query].assembly_accession.strip()}
     if wgs_gcas:
-        upgraded = _fetch_genomes(client, KIND_GCA, accessions=sorted(set(wgs_gcas.values())))
+        upgraded = _fetch_genomes(client, TYPE_GCA, accessions=sorted(set(wgs_gcas.values())))
         for query, gca in wgs_gcas.items():
             if gca in upgraded:
                 found[query] = upgraded[gca]
@@ -675,11 +707,11 @@ def lookup_genomes(client, accessions):
         taken.add(record.genome_accession)
         records[accession.raw] = replace(record, input_accession=accession.raw)
 
-    _mark_non_mags(records.values())
+    _label_non_mags(records.values())
     return records
 
 
-def _mark_non_mags(records):
+def _label_non_mags(records: Iterable[GenomeRecord]) -> None:
     """Set source_sample_status to not_a_mag for genomes whose assembly_type is in
     NON_MAG_ASSEMBLY_TYPES."""
     for record in records:
@@ -720,7 +752,7 @@ IDENTICAL_COLUMNS = ["sequence_md5", "kept_genome", "n_genomes", "genomes", "stu
 EBI_CENTER_NAME = "EMG"
 
 
-def _accession_of_file(name):
+def _accession_of_file(name: str) -> Optional[Tuple[str, str]]:
     """Read the accession from a FASTA file name:
 
         GCA_937896655.1.fna.gz  -> ("GCA_937896655", "1")
@@ -735,7 +767,8 @@ def _accession_of_file(name):
     return None
 
 
-def find_fasta_files(fasta_dir, records):
+def find_fasta_files(fasta_dir: str, records: List[GenomeRecord]
+                     ) -> Tuple[List[Tuple[GenomeRecord, str]], List[str]]:
     """Find each record's FASTA file in fasta_dir by its name: GCA_937896655.1.fna.gz or
     GCA_937896655.fna.gz for GCA_937896655 at version 1. A file named with another
     version, such as GCA_937896655.2.fna.gz, is not used. Returns [(record, path)] and
@@ -757,7 +790,7 @@ def find_fasta_files(fasta_dir, records):
     return found, other_version
 
 
-def _read_fasta_sequences(path):
+def _read_fasta_sequences(path: str) -> Iterator[str]:
     """Read the sequences of a FASTA file (plain or gzipped) one at a time, uppercased
     and without whitespace."""
     opener = gzip.open if path.endswith(".gz") else open
@@ -774,7 +807,7 @@ def _read_fasta_sequences(path):
             yield "".join(parts).upper()
 
 
-def sequence_checksum(path):
+def sequence_checksum(path: str) -> str:
     """Return the genome's checksum: the MD5 of the sorted MD5s of its sequences, or ""
     if the file holds no sequence."""
     hashes = sorted(hashlib.md5(sequence.encode("ascii", errors="replace")).hexdigest()
@@ -784,7 +817,7 @@ def sequence_checksum(path):
     return hashlib.md5("\n".join(hashes).encode("ascii")).hexdigest()
 
 
-def find_identical_sequences(records, fasta_dir):
+def find_identical_sequences(records: List[GenomeRecord], fasta_dir: str) -> IdenticalSets:
     """Record each input MAG's checksum in sequence_md5, and set sequence_check to unique
     or no_fasta_file. Returns the sets of identical genomes as {checksum: genomes};
     choose_kept_copies() picks the kept copy after tracing."""
@@ -813,7 +846,7 @@ def find_identical_sequences(records, fasta_dir):
     return {checksum: same for checksum, same in by_checksum.items() if len(same) >= 2}
 
 
-def _kept_first(record):
+def _kept_first(record: GenomeRecord) -> Tuple[bool, bool, bool, str]:
     """The order in which copies are chosen as the kept one: a traced copy first (only
     traced genomes get a source group), then a copy from EMG, then a GCA before an ERZ
     (the GCA is the INSDC accession, with a version), then the lowest accession."""
@@ -823,7 +856,7 @@ def _kept_first(record):
             record.genome_accession)
 
 
-def choose_kept_copies(sets):
+def choose_kept_copies(sets: IdenticalSets) -> None:
     """After tracing, keep one copy of each set of identical genomes (see _kept_first) and
     mark the others duplicate. Each set is sorted with the kept copy first."""
     for same in sets.values():
@@ -833,7 +866,7 @@ def choose_kept_copies(sets):
             record.sequence_check = SEQ_DUPLICATE
 
 
-def write_identical_sequences_tsv(path, sets):
+def write_identical_sequences_tsv(path: str, sets: IdenticalSets) -> None:
     """Write identical_sequences.tsv: one row per set of identical genomes, with the
     kept genome listed first."""
     rows = []
@@ -882,7 +915,8 @@ class TraceResult:
     """What was found by tracing one MAG sample, e.g. SAMEA112717052:
 
     source_samples  ["SAMEA3504092"]
-    search_keys     {"SAMEA3504092", "ERS811241"}: every accession of the source samples
+    search_keys     {"SAMEA3504092", "ERS811241"}: every accession of the source samples,
+                    and any range written in derived_from (e.g. ERS9142775-ERS9142786)
     runs            ["ERR982800"]: the runs of the source samples
     status          "traced": the source_sample_status
 
@@ -896,13 +930,13 @@ class TraceResult:
     status: str = ""
 
 
-def _both_forms(row):
+def _both_forms(row: Row) -> List[str]:
     """The two accessions ENA gives for one sample: BioSample, and INSDC secondary."""
     return [row.get("sample_accession", "").strip(),
             row.get("secondary_sample_accession", "").strip()]
 
 
-def _canonical_sample(row, fallback=""):
+def _canonical_sample(row: Row, fallback: str = "") -> str:
     """Return the one accession we use for this sample, so the same sample is always
     written the same way: its BioSample (SAMEA2622837) if ENA gives one, otherwise its
     older accession (ERS492926), otherwise fallback (the value as written in derived_from).
@@ -911,7 +945,7 @@ def _canonical_sample(row, fallback=""):
     return biosample or secondary or fallback
 
 
-def _index_samples_by_either_form(rows):
+def _index_samples_by_either_form(rows: List[Row]) -> Dict[str, Row]:
     """Index sample rows under both of their accessions, so a lookup by either one hits."""
     index = {}
     for row in rows:
@@ -921,7 +955,7 @@ def _index_samples_by_either_form(rows):
     return index
 
 
-def _index_runs(rows):
+def _index_runs(rows: List[Row]) -> Tuple[Dict[str, Row], Dict[str, List[Row]]]:
     """Make two lookups from read_run rows: by run (ERR982800 -> its row) and by sample
     (SAMEA3504092 or ERS811241 -> the rows of all its runs)."""
     by_run = {}
@@ -940,19 +974,24 @@ class _Trace:
     """The tracing of one MAG sample: what it has found so far (result), the links to
     look up in the next step (to_look_up), and the samples already looked up (visited)."""
 
-    def __init__(self, mag_sample):
+    def __init__(self, mag_sample: str) -> None:
         self.result = TraceResult()
         self.visited = {mag_sample}
         self.to_look_up = []
         # A derived_from value that is not an accession (e.g. "missing").
         self.saw_unparsable = False
-        # A link that leads to no data: a run or sample ENA has no record of, or a sample
-        # with no runs and nothing further back.
+        # A link that never reaches a sample with runs.
         self.saw_missing_parent = False
+        # The MAG had a sample or run to look up. If no source sample is found, this
+        # gives source_not_found instead of no_derived_from.
+        self.followed_link = False
         # ENA has no record of the MAG sample itself.
         self.mag_sample_missing = False
+        # Ranges longer than MAX_RANGE_SIZE, kept as written instead of split into samples.
+        self.unexpanded_ranges = set()
 
-    def add_source(self, canonical, search_keys=(), runs=()):
+    def add_source(self, canonical: str, search_keys: Iterable[str] = (),
+                   runs: Iterable[str] = ()) -> None:
         if canonical and canonical not in self.result.source_samples:
             self.result.source_samples.append(canonical)
         self.result.search_keys.update(form for form in search_keys if form)
@@ -960,26 +999,35 @@ class _Trace:
             if run and run not in self.result.runs:
                 self.result.runs.append(run)
 
-    def enqueue(self, parent):
-        """Decide what to do with one derived_from value of this MAG's sample:
+    def enqueue(self, parent: ParentValue) -> None:
+        """Add one derived_from value of the MAG sample to the trace, according to its
+        type:
 
-            ERS9142775-ERS9142786     a range: recorded as a source sample, as written
-            missing                   not an accession: noted, so the status can say why
-                                      tracing failed
-            SAMEA3504092, ERR982800   a sample or run: looked up in the next step,
-                                      unless already looked up for this MAG
+            SAMEA3504092, ERR982800   a sample or run: looked up in the next step
+            ERS9142775-ERS9142786     a range: split into single samples (or runs),
+                                      and each one is looked up
+            missing                   not an accession: skipped, and the MAG's status
+                                      says why
         """
-        if parent.kind == PARENT_RANGE:
-            # Ranges are not expanded, so only MAGs that list exactly the same range share
-            # a source group.
-            self.add_source(parent.raw, search_keys=[parent.raw])
-        elif parent.kind == PARENT_UNPARSABLE:
+        if parent.parent_type == PARENT_RANGE:
+            members = expand_range(parent.raw)
+            if not members:
+                self.unexpanded_ranges.add(parent.raw)
+                self.add_source(parent.raw, search_keys=[parent.raw])
+                return
+            # ENA matches the exact text, so a MAG that writes this same range is found
+            # only by searching for the range itself, not for its samples.
+            self.result.search_keys.add(parent.raw)
+            for member in members:
+                self.enqueue(ParentValue(member, classify_parent(member)))
+        elif parent.parent_type == PARENT_UNPARSABLE:
             self.saw_unparsable = True
         elif parent.raw not in self.visited:
             self.visited.add(parent.raw)
             self.to_look_up.append(parent)
+            self.followed_link = True
 
-    def finish(self):
+    def finish(self) -> TraceResult:
         """Set the status and return the result.
 
         If at least one source sample was found, the status is traced, or partly_traced
@@ -997,14 +1045,15 @@ class _Trace:
             self.result.status = STATUS_MAG_SAMPLE_NOT_FOUND
         elif unfinished:
             self.result.status = STATUS_TRACE_TOO_LONG
-        elif self.saw_missing_parent:
+        elif self.saw_missing_parent or self.followed_link:
             self.result.status = STATUS_SOURCE_NOT_FOUND
         else:
             self.result.status = STATUS_NO_DERIVED_FROM
         return self.result
 
 
-def trace_source_samples(client, mag_samples):
+def trace_source_samples(client: EnaClient, mag_samples: Iterable[str]
+                         ) -> Dict[str, TraceResult]:
     """Trace each MAG sample back to its source samples.
 
     Returns {MAG sample: TraceResult}, with an entry for every MAG sample, including
@@ -1044,7 +1093,7 @@ def trace_source_samples(client, mag_samples):
         for mag_sample, trace in traces.items():
             current, trace.to_look_up = trace.to_look_up, []
             for parent in current:
-                if parent.kind == PARENT_RUN:
+                if parent.parent_type == PARENT_RUN:
                     row = by_run.get(parent.raw)
                     if row is None or not _canonical_sample(row):
                         # The link names a run ENA has no record of. A run has no
@@ -1080,13 +1129,20 @@ def trace_source_samples(client, mag_samples):
                     trace.saw_missing_parent = True
                     continue
                 trace.visited.update(form for form in _both_forms(row) if form)
-                before = (len(trace.to_look_up), len(trace.result.source_samples))
-                for parent in parse_related_field(row.get("related_sample_accession")):
+                links = parse_related_field(row.get("related_sample_accession"))
+                for parent in links:
                     trace.enqueue(parent)
-                if (len(trace.to_look_up), len(trace.result.source_samples)) == before:
-                    # A sample with no runs and nothing new to follow (e.g. SRS1615213):
-                    # this link leads to no data.
+                if all(parent.parent_type == PARENT_UNPARSABLE for parent in links):
+                    # No runs and no derived_from to follow (e.g. SRS1615213): this link
+                    # leads nowhere.
                     trace.saw_missing_parent = True
+
+    unexpanded = Counter(token for trace in traces.values()
+                         for token in trace.unexpanded_ranges)
+    for token, mag_samples in sorted(unexpanded.items()):
+        LOG.warning("range %s in derived_from has more than %s accessions, so it is "
+                    "kept as written, as one source sample (named by %s MAG sample(s))",
+                    token, MAX_RANGE_SIZE, mag_samples)
 
     unfinished = sum(1 for trace in traces.values() if trace.to_look_up)
     if unfinished:
@@ -1112,13 +1168,14 @@ def trace_source_samples(client, mag_samples):
 #   ERS492926      its older accession
 #   ERR599156      one of its runs
 #
-# A source sample that is a range (e.g. ERS9142775-ERS9142786) is searched as written.
+# A range in derived_from (e.g. ERS9142775-ERS9142786) is searched both as written and
+# through the samples in it.
 #
 # A sample found this way that has no MAG (e.g. a bin) becomes a search key in the next
 # step, because MAGs can name the bin instead of the source sample. This repeats for up
 # to MAX_TRACE_STEPS steps.
 
-def build_derived_from_query(keys):
+def build_derived_from_query(keys: Iterable[str]) -> str:
     """Build the ENA search for samples whose derived_from names any of keys:
 
         ["SAMEA2622837", "ERS492926"] ->
@@ -1130,7 +1187,7 @@ def build_derived_from_query(keys):
     return " OR ".join(terms)
 
 
-def source_search_keys(trace_results):
+def source_search_keys(trace_results: Iterable[TraceResult]) -> List[str]:
     """The accessions and runs of all source samples found, for the reverse lookup. This
     includes partly_traced genomes: some of their links failed, but the source samples
     they have are correct."""
@@ -1143,7 +1200,7 @@ def source_search_keys(trace_results):
     return sorted(keys)
 
 
-def find_samples_derived_from(client, keys):
+def find_samples_derived_from(client: EnaClient, keys: List[str]) -> Dict[str, List[str]]:
     """Search ENA for every sample whose derived_from names one of keys. Returns
     {sample: its accessions}, in the order found; each sample is named by its BioSample
     accession where ENA has one."""
@@ -1157,7 +1214,8 @@ def find_samples_derived_from(client, keys):
     return found
 
 
-def find_other_genomes(client, keys, known_samples):
+def find_other_genomes(client: EnaClient, keys: List[str],
+                       known_samples: Iterable[str]) -> List[GenomeRecord]:
     """The reverse lookup: search ENA for genomes built from the source samples, step by
     step as described above. keys are the source samples' accessions and runs. The input
     genomes' own samples (known_samples) are skipped."""
@@ -1178,7 +1236,8 @@ def find_other_genomes(client, keys, known_samples):
     return genomes
 
 
-def find_genomes_of_samples(client, samples):
+def find_genomes_of_samples(client: EnaClient, samples: List[str]
+                            ) -> Tuple[List[GenomeRecord], List[str]]:
     """Find the genomes of samples found by find_samples_derived_from(). Both the
     assembly (GCA) and analysis (ERZ) endpoints are searched, because another study's
     genome can be either. Returns the genomes (non-MAGs included, as not_a_mag) and the
@@ -1187,14 +1246,14 @@ def find_genomes_of_samples(client, samples):
     for start in range(0, len(samples), client.batch_size):
         chunk = samples[start:start + client.batch_size]
         query = " OR ".join('sample_accession="%s"' % s for s in chunk)
-        for kind in (KIND_GCA, KIND_ERZ):
-            for record in _fetch_genomes(client, kind, query=query).values():
+        for accession_type in (TYPE_GCA, TYPE_ERZ):
+            for record in _fetch_genomes(client, accession_type, query=query).values():
                 by_sample.setdefault(record.mag_sample, []).append(record)
 
     genomes, without_mag = [], []
     for sample in samples:
         records = by_sample.get(sample, [])
-        _mark_non_mags(records)
+        _label_non_mags(records)
         mags = [r for r in records if r.source_sample_status != STATUS_NOT_A_MAG]
         # A MAG submitted as an ERZ analysis also has a GCA under the same sample (e.g.
         # ERZ21930820 and GCA_963687975 under SAMEA114724776), so ERZs are kept only
@@ -1219,7 +1278,8 @@ def find_genomes_of_samples(client, samples):
 #   to_compare              its source group has genomes from 2 or more studies, so
 #                           phase 2 compares it
 #   single_study            all genomes in its source group are from one study, so it
-#                           can't be a duplicate
+#                           isn't compared (e.g. several same-species bins from one
+#                           sample, deposited by one study)
 #   duplicate_sequence      it has the same sequence as another input genome (the one
 #                           with sequence_check duplicate_kept), which is compared instead
 #   no_source_group         its source_sample_status isn't traced, so it has no source
@@ -1244,13 +1304,13 @@ DUP_NO_SOURCE_GROUP = "no_source_group"
 DUP_DUPLICATE_SEQUENCE = "duplicate_sequence"
 
 
-def _short_id(prefix, items):
+def _short_id(prefix: str, items: Iterable[str]) -> str:
     """A short id that stays the same in every run: prefix plus 12 characters of a hash
     of items."""
     return prefix + hashlib.sha1("|".join(items).encode("utf-8")).hexdigest()[:12]
 
 
-def fingerprint(source_samples):
+def fingerprint(source_samples: Iterable[str]) -> str:
     """Return the source group id, made from the sorted source samples, so the same
     samples always give the same id:
 
@@ -1262,7 +1322,7 @@ def fingerprint(source_samples):
     return _short_id("sg_", sorted(set(sample for sample in source_samples if sample)))
 
 
-def build_source_groups(records):
+def build_source_groups(records: List[GenomeRecord]) -> StudiesByGroup:
     """Give every fully traced genome its source group id and its phase 1
     duplicate_status. Identical copies (sequence_check duplicate) get no group, so they
     are not compared again. Returns {source_group_id: set of study accessions}."""
@@ -1284,7 +1344,7 @@ def build_source_groups(records):
     return studies_by_group_id
 
 
-def studies_by_group(records):
+def studies_by_group(records: Iterable[GenomeRecord]) -> StudiesByGroup:
     """Return {source_group_id: set of study accessions} for records that have a group id.
 
     Phase 2 uses this to rebuild the groups from mags.tsv.
@@ -1299,7 +1359,8 @@ def studies_by_group(records):
     return studies
 
 
-def _multi_study(studies_by_group_id, group_id):
+def _multi_study(studies_by_group_id: StudiesByGroup, group_id: str) -> bool:
+    """True when the source group has genomes from 2 or more studies."""
     return len(studies_by_group_id.get(group_id, ())) >= 2
 
 
@@ -1321,18 +1382,18 @@ MAGS_COLUMNS = [
 ]
 
 
-def _join(values):
+def _join(values: Iterable[str]) -> str:
     return ",".join(values)
 
 
-def versioned(record):
+def versioned(record: GenomeRecord) -> str:
     """GCA_937896655 at version 1 is written as GCA_937896655.1."""
     if record.version:
         return record.genome_accession + "." + record.version
     return record.genome_accession
 
 
-def split_version(accession):
+def split_version(accession: str) -> Tuple[str, str]:
     """GCA_937896655.1 -> ("GCA_937896655", "1")."""
     base, dot, version = accession.rpartition(".")
     if dot and version.isdigit():
@@ -1340,7 +1401,7 @@ def split_version(accession):
     return accession, ""
 
 
-def _to_cell(value):
+def _to_cell(value: Union[str, List[str]]) -> str:
     """A list is written sorted and joined by commas:
     ["SAMEA2622837", "SAMEA2622733"] -> "SAMEA2622733,SAMEA2622837"."""
     if isinstance(value, list):
@@ -1348,14 +1409,14 @@ def _to_cell(value):
     return value
 
 
-def _from_cell(field_type, text):
+def _from_cell(field_type: object, text: str) -> Union[str, List[str]]:
     """The reverse of _to_cell, for list fields; other fields stay as text."""
     if field_type == List[str]:
         return [part for part in text.split(",") if part]
     return text
 
 
-def _write_tsv(path, columns, rows):
+def _write_tsv(path: str, columns: List[str], rows: Iterable[Sequence[str]]) -> None:
     """Write a tab-separated file: a header line with the column names, then the rows."""
     with open(path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle, delimiter="\t", lineterminator="\n")
@@ -1363,7 +1424,7 @@ def _write_tsv(path, columns, rows):
         writer.writerows(rows)
 
 
-def write_mags_tsv(path, records):
+def write_mags_tsv(path: str, records: Iterable[GenomeRecord]) -> None:
     """Write one row per genome, including inputs that could not be traced (their
     source_sample_status says why), so every input line appears in the output."""
     rows = []
@@ -1375,7 +1436,7 @@ def write_mags_tsv(path, records):
     _write_tsv(path, MAGS_COLUMNS, rows)
 
 
-def read_mags_tsv(path):
+def read_mags_tsv(path: str) -> List[GenomeRecord]:
     """Rebuild GenomeRecords from mags.tsv, for phase 2. The run stops if the columns
     aren't the ones this script writes, for example in a mags.tsv from an older version:
     a missing column would otherwise be read as empty for every genome."""
@@ -1394,24 +1455,25 @@ def read_mags_tsv(path):
     return records
 
 
-def _number(value):
+def _number(value: int) -> str:
     """1234 -> "1,234"."""
     return "{:,}".format(value)
 
 
-def _log_row(label, count, note=""):
+def _log_row(label: str, count: int, note: str = "") -> None:
     """One line of the run summary: a label, a right-aligned count and an optional note."""
     LOG.info("  %-36s %7s%s", label, _number(count), "  (%s)" % note if note else "")
 
 
-def _log_status_table(title, records, statuses):
+def _log_status_table(title: str, records: List[GenomeRecord],
+                      statuses: Sequence[str]) -> None:
     """Count the records with each duplicate_status in statuses, in two columns: genomes
     from the input list, and genomes found by reverse lookup."""
     inputs = Counter(r.duplicate_status for r in records if r.input_accession)
     found = Counter(r.duplicate_status for r in records if not r.input_accession)
     table = "  %-36s %14s %16s"
     LOG.info("")
-    LOG.info(table, title, "in your list", "reverse lookup")
+    LOG.info(table, title, "input list", "reverse lookup")
     for status in statuses:
         LOG.info(table, "  " + status, _number(inputs[status]), _number(found[status]))
     LOG.info(table, "  total", _number(sum(inputs[s] for s in statuses)),
@@ -1423,7 +1485,7 @@ UNTRACEABLE_STATUSES = (STATUS_INVALID, STATUS_ACCESSION_NOT_FOUND, STATUS_NOT_A
                         STATUS_REPEATED_INPUT)
 
 
-def _log_sequence_check(inputs, fasta_checked):
+def _log_sequence_check(inputs: List[GenomeRecord], fasta_checked: bool) -> None:
     """Print step 1 of the phase 1 summary: the sequence_check counts of the inputs."""
     LOG.info("Step 1: compare the input genomes' sequences")
     if not fasta_checked:
@@ -1438,7 +1500,8 @@ def _log_sequence_check(inputs, fasta_checked):
         _log_row("  " + value, counts[value], note)
 
 
-def log_phase1_summary(records, studies_by_group_id, client, fasta_checked=False):
+def log_phase1_summary(records: List[GenomeRecord], studies_by_group_id: StudiesByGroup,
+                       client: EnaClient, fasta_checked: bool = False) -> None:
     """Print the phase 1 summary. fasta_checked is True when --fasta-dir was given."""
     inputs = [r for r in records if r.input_accession]
     statuses = Counter(r.source_sample_status for r in inputs)
@@ -1459,7 +1522,7 @@ def log_phase1_summary(records, studies_by_group_id, client, fasta_checked=False
     for status, count in statuses.most_common():
         _log_row("  " + status, count, rate if status == STATUS_TRACED else "")
     _log_row("genomes found by reverse lookup", len(records) - len(inputs),
-             "from the same source samples, not in your list")
+             "from the same source samples, not in the input list")
     _log_row("source groups", len(studies_by_group_id),
              "%s used by 2 or more studies" % _number(multi))
     _log_row("ENA requests", client.request_count,
@@ -1479,14 +1542,9 @@ def log_phase1_summary(records, studies_by_group_id, client, fasta_checked=False
 ENA_FASTA_URL = "https://www.ebi.ac.uk/ena/browser/api/fasta/%s?download=true"
 
 
-def read_gemsparcl_clusters(path, genomes):
-    """Read a gemsparcl *_clusters.csv into {genome accession: cluster}, keeping only the
-    given genomes (versioned, e.g. GCA_937896655.1), because the file can hold millions
-    of rows. An id with a version matches only that version.
-
-    An id without a version (GCA_937896655) matches the genome's version in mags.tsv.
-    This is only for benchmarking with older clusters files that have no versions, and
-    the number of genomes matched this way is logged."""
+def read_gemsparcl_clusters(path: str, genomes: Set[str]) -> Dict[str, str]:
+    """Read a gemsparcl *_clusters.csv and return {genome accession: cluster}, only for
+    the given genomes (e.g. GCA_937896655.1), as the file can hold millions of rows."""
     by_unversioned = {split_version(genome)[0]: genome for genome in genomes}
     assignments = {}
     matched_without_version = set()
@@ -1511,19 +1569,19 @@ def read_gemsparcl_clusters(path, genomes):
                 assignments[by_unversioned[genome]] = cluster
                 matched_without_version.add(by_unversioned[genome])
     if matched_without_version:
-        LOG.warning("%s genome(s) were matched without a version: %s has ids such as "
-                    "GCA_937896655 instead of GCA_937896655.1",
+        LOG.warning("%s genome(s) were matched without a version: %s has accessions "
+                    "such as GCA_937896655 instead of GCA_937896655.1",
                     _number(len(matched_without_version)), path)
     return assignments
 
 
-def attach_clusters(records, assignments):
+def attach_clusters(records: Iterable[GenomeRecord], assignments: Dict[str, str]) -> None:
     """Set each genome's gemsparcl_cluster from the clusters file."""
     for record in records:
         record.gemsparcl_cluster = assignments.get(versioned(record), "")
 
 
-def _fasta_url(record):
+def _fasta_url(record: GenomeRecord) -> str:
     """The link to download the genome's sequence: fasta_ftp if ENA has one (ERZ
     analyses), otherwise ENA's FASTA download (e.g. for GCA_937896655)."""
     if record.fasta_ftp:
@@ -1532,7 +1590,9 @@ def _fasta_url(record):
     return ENA_FASTA_URL % record.genome_accession
 
 
-def build_organism_check_candidates(records, studies_by_group_id):
+def build_organism_check_candidates(records: List[GenomeRecord],
+                                    studies_by_group_id: StudiesByGroup
+                                    ) -> List[Tuple[str, str, str]]:
     """Genomes in source groups with 2 or more studies that have no gemsparcl cluster
     yet, each with a download link, so they can be run through gemsparcl query."""
     candidates = []
@@ -1576,7 +1636,7 @@ class DuplicateGroup:
     declared_runs_match: str
 
 
-def _compare_declared_runs(genomes):
+def _compare_declared_runs(genomes: List[GenomeRecord]) -> str:
     """Compare the runs the genomes list in ENA (their declared_runs), for the
     declared_runs_match column of duplicates.tsv:
 
@@ -1593,12 +1653,13 @@ def _compare_declared_runs(genomes):
     return "same" if len(run_sets) == 1 else "different"
 
 
-def _from_other_study(a, b):
+def _from_other_study(a: GenomeRecord, b: GenomeRecord) -> bool:
+    """True when both genomes have a study, and the studies differ."""
     return bool(a.study_accession and b.study_accession
                 and a.study_accession != b.study_accession)
 
 
-def _organism_verdict(record, members):
+def _organism_verdict(record: GenomeRecord, members: List[GenomeRecord]) -> str:
     """Return the phase 2 duplicate_status of one genome (record): compare its gemsparcl
     cluster with the clusters of the genomes from other studies in its source group."""
     if not record.gemsparcl_cluster:
@@ -1611,7 +1672,8 @@ def _organism_verdict(record, members):
     return DUP_NOT_DUPLICATE
 
 
-def assign_duplicates(records, studies_by_group_id):
+def assign_duplicates(records: List[GenomeRecord], studies_by_group_id: StudiesByGroup
+                      ) -> List[DuplicateGroup]:
     """Set duplicate_status for every genome in a multi-study group; return the
     duplicate groups."""
     members_by_group = {}
@@ -1645,7 +1707,8 @@ def assign_duplicates(records, studies_by_group_id):
     return duplicates
 
 
-def write_duplicates_tsv(path, duplicates):
+def write_duplicates_tsv(path: str, duplicates: List[DuplicateGroup]) -> None:
+    """Write duplicates.tsv: one row per duplicate group."""
     _write_tsv(path, DUPLICATES_COLUMNS, [
         [dup.duplicate_id, dup.source_group_id, dup.gemsparcl_cluster,
          str(len(dup.genomes)), str(len(dup.studies)), dup.declared_runs_match,
@@ -1657,7 +1720,7 @@ def write_duplicates_tsv(path, duplicates):
 # Command line and running the phases
 # ---------------------------------------------------------------------------
 
-def read_accessions(path):
+def read_accessions(path: str) -> List[str]:
     """Read one accession per line, in order, skipping repeats, blank lines, '#' comments
     and any columns after the first."""
     out, seen = [], set()
@@ -1671,14 +1734,16 @@ def read_accessions(path):
     return out
 
 
-def _apply_trace(record, trace_result):
+def _apply_trace(record: GenomeRecord, trace_result: Optional[TraceResult]) -> None:
     """Copy a TraceResult onto a record."""
     if trace_result is not None:
         record.source_samples = list(trace_result.source_samples)
         record.source_sample_status = trace_result.status
 
 
-def run_pipeline(client, accessions, expand_enabled=True, fasta_dir=None):
+def run_pipeline(client: EnaClient, accessions: List[Accession],
+                 expand_enabled: bool = True, fasta_dir: Optional[str] = None
+                 ) -> Tuple[List[GenomeRecord], StudiesByGroup, Optional[IdenticalSets]]:
     """Phase 1. Look up the input genomes, compare their sequences (with fasta_dir),
     trace them to their source samples, keep one copy of each set of identical genomes,
     find other genomes from the source samples (reverse lookup), trace those too, and
@@ -1716,49 +1781,60 @@ def run_pipeline(client, accessions, expand_enabled=True, fasta_dir=None):
     return all_records, build_source_groups(all_records), identical
 
 
-def _phase1(args, client):
+def _phase1(client: EnaClient, accessions_file: str, outdir: str,
+            fasta_dir: Optional[str] = None, expand: bool = True) -> None:
+    """Run phase 1 on the accessions in accessions_file and write mags.tsv (and, with
+    fasta_dir, identical_sequences.tsv) to outdir. expand=False skips the reverse lookup.
+    Raises ValueError if accessions_file holds no accessions, or fasta_dir is not a
+    folder."""
     LOG.info("")
     LOG.info("Phase 1: provenance of the genomes in ENA")
-    accessions = [classify_accession(a) for a in read_accessions(args.accessions)]
+    accessions = [classify_accession(a) for a in read_accessions(accessions_file)]
     if not accessions:
-        LOG.error("no accessions found in %s", args.accessions)
-        return 1
-    if args.fasta_dir and not os.path.isdir(args.fasta_dir):
-        LOG.error("%s is not a folder", args.fasta_dir)
-        return 1
+        raise ValueError("no accessions found in %s" % accessions_file)
+    if fasta_dir and not os.path.isdir(fasta_dir):
+        raise ValueError("%s is not a folder" % fasta_dir)
 
     records, studies_by_group_id, identical = run_pipeline(
-        client, accessions, expand_enabled=not args.no_expand, fasta_dir=args.fasta_dir)
+        client, accessions, expand_enabled=expand, fasta_dir=fasta_dir)
 
-    write_mags_tsv(os.path.join(args.outdir, "mags.tsv"), records)
+    write_mags_tsv(os.path.join(outdir, "mags.tsv"), records)
     if identical is not None:
-        write_identical_sequences_tsv(os.path.join(args.outdir, IDENTICAL_FILE),
-                                      identical)
+        write_identical_sequences_tsv(os.path.join(outdir, IDENTICAL_FILE), identical)
 
-    log_phase1_summary(records, studies_by_group_id, client,
-                       fasta_checked=bool(args.fasta_dir))
-    return 0
+    log_phase1_summary(records, studies_by_group_id, client, fasta_checked=bool(fasta_dir))
 
 
-def _phase2(args):
+def _phase2(clusters_file: str, outdir: str) -> None:
+    """Run phase 2: read mags.tsv from outdir and the gemsparcl clusters_file, then write
+    duplicates.tsv and organism_check_candidates.tsv, and update mags.tsv. Raises
+    ValueError if outdir has no mags.tsv, or if the column names of mags.tsv are not the
+    ones expected."""
     LOG.info("")
     LOG.info("Phase 2: compare gemsparcl clusters within source groups used by 2 or more "
              "studies")
-    mags_path = os.path.join(args.outdir, "mags.tsv")
+    mags_path = os.path.join(outdir, "mags.tsv")
     if not os.path.exists(mags_path):
-        LOG.error("%s not found. Run phase 1 first (--accessions).", mags_path)
-        return 1
+        raise ValueError("%s not found. Run phase 1 first (--accessions)." % mags_path)
 
+    # Read the phase 1 results back, and the studies in each source group.
     records = read_mags_tsv(mags_path)
     studies_by_group_id = studies_by_group(records)
-    genomes = {versioned(r) for r in records if r.genome_accession}
-    attach_clusters(records, read_gemsparcl_clusters(args.gemsparcl_clusters, genomes))
 
+    # Give each genome its gemsparcl cluster. Only the genomes in mags.tsv are kept from
+    # the clusters file.
+    genomes = {versioned(r) for r in records if r.genome_accession}
+    attach_clusters(records, read_gemsparcl_clusters(clusters_file, genomes))
+
+    # In each source group with 2 or more studies, compare the clusters: set every
+    # genome's duplicate_status, and collect the duplicate groups.
     duplicates = assign_duplicates(records, studies_by_group_id)
-    write_duplicates_tsv(os.path.join(args.outdir, "duplicates.tsv"), duplicates)
+    write_duplicates_tsv(os.path.join(outdir, "duplicates.tsv"), duplicates)
     write_mags_tsv(mags_path, records)
+
+    # Genomes in those groups that have no cluster, to run through gemsparcl query.
     candidates = build_organism_check_candidates(records, studies_by_group_id)
-    _write_tsv(os.path.join(args.outdir, CANDIDATES_FILE), CANDIDATE_COLUMNS, candidates)
+    _write_tsv(os.path.join(outdir, CANDIDATES_FILE), CANDIDATE_COLUMNS, candidates)
 
     compared = [r for r in records
                 if _multi_study(studies_by_group_id, r.source_group_id)]
@@ -1770,7 +1846,6 @@ def _phase2(args):
              % _number(sum(len(dup.genomes) for dup in duplicates)))
     _log_row("genomes for gemsparcl query", len(candidates),
              "the no_cluster ones, in %s" % CANDIDATES_FILE)
-    return 0
 
 
 HELP_DESCRIPTION = """\
@@ -1808,13 +1883,13 @@ output files, in --outdir:
                                  each step, for every run"""
 
 
-def _help_formatter(prog):
+def _help_formatter(prog: str) -> argparse.HelpFormatter:
     """Lay out --help: the description and examples exactly as written, each option's
     help on the same line as its name, and lines 90 characters wide on any terminal."""
     return argparse.RawDescriptionHelpFormatter(prog, max_help_position=30, width=90)
 
 
-def build_arg_parser():
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="mag_source_duplicates.py", description=HELP_DESCRIPTION, epilog=HELP_EPILOG,
         formatter_class=_help_formatter)
@@ -1846,20 +1921,20 @@ class _MessageFormatter(logging.Formatter):
     """Print each message as it is, with "WARNING: " or "ERROR: " in front of warnings
     and errors, e.g. ERROR: results/mags.tsv not found. Run phase 1 first (--accessions)."""
 
-    def format(self, record):
+    def format(self, record: logging.LogRecord) -> str:
         message = record.getMessage()
         if record.levelno >= logging.WARNING:
             return "%s: %s" % (record.levelname, message)
         return message
 
 
-def _add_log_handler(handler, level):
+def _add_log_handler(handler: logging.Handler, level: int) -> None:
     handler.setLevel(level)
     handler.setFormatter(_MessageFormatter())
     LOG.addHandler(handler)
 
 
-def _start_logging():
+def _start_logging() -> None:
     """Print the summary, warnings and errors on screen. The log file is added once
     --outdir exists."""
     for handler in list(LOG.handlers):  # so that calling main() twice doesn't print twice
@@ -1870,7 +1945,7 @@ def _start_logging():
     _add_log_handler(logging.StreamHandler(sys.stderr), logging.INFO)
 
 
-def _start_log_file(path):
+def _start_log_file(path: str) -> None:
     """Write everything printed on screen to the log file, plus the details of each step,
     which aren't printed."""
     if os.path.exists(path) and os.path.getsize(path):
@@ -1879,33 +1954,30 @@ def _start_log_file(path):
     _add_log_handler(logging.FileHandler(path, encoding="utf-8"), logging.DEBUG)
 
 
-def main(argv=None):
+def main(argv: Optional[Sequence[str]] = None) -> None:
     argv = sys.argv[1:] if argv is None else list(argv)
-    args = build_arg_parser().parse_args(argv)
-    _start_logging()
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
     if not args.accessions and not args.gemsparcl_clusters:
-        LOG.error("give --accessions (phase 1) or --gemsparcl-clusters (phase 2)")
-        return 2
+        parser.error("give --accessions (phase 1) or --gemsparcl-clusters (phase 2)")
+    _start_logging()
     try:
         os.makedirs(args.outdir, exist_ok=True)
         log_path = os.path.join(args.outdir, LOG_FILE)
         _start_log_file(log_path)
         LOG.info("mag_source_duplicates.py, %s", time.strftime("%Y-%m-%d %H:%M"))
         LOG.info("command: %s", " ".join(shlex.quote(a) for a in [sys.argv[0]] + argv))
-        code = 0
         if args.accessions:
-            client = EnaClient(cache_dir=args.cache_dir)
-            code = _phase1(args, client)
-        if code == 0 and args.gemsparcl_clusters:
-            code = _phase2(args)
-        if code == 0:
-            LOG.info("")
-            LOG.info("Results and %s written to %s", LOG_FILE, args.outdir)
-        return code
+            _phase1(EnaClient(cache_dir=args.cache_dir), args.accessions, args.outdir,
+                    fasta_dir=args.fasta_dir, expand=not args.no_expand)
+        if args.gemsparcl_clusters:
+            _phase2(args.gemsparcl_clusters, args.outdir)
+        LOG.info("")
+        LOG.info("Results and %s written to %s", LOG_FILE, args.outdir)
     except (EnaError, ValueError, OSError) as exc:
         LOG.error("%s", exc)
-        return 1
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
